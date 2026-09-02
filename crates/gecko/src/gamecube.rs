@@ -63,6 +63,11 @@ impl GameCube {
             .phys_write_u32(0x28, crate::mmio::constants::RAM_SIZE as u32);
         emulator.mmio.phys_write_u32(0x2C, 1); // retail console
         emulator.mmio.phys_write_u32(0xD0, ARAM_SIZE);
+        // Bus and CPU clock speeds, as the IPL writes them. The SDK derives every
+        // tick conversion from the bus clock; left at zero, OSMillisecondsToTicks is
+        // zero and every timed wait built on it is over before it starts.
+        emulator.mmio.phys_write_u32(0xF8, 0x09A7_EC80);
+        emulator.mmio.phys_write_u32(0xFC, 0x1CF7_C580);
 
         // Syscall stub? rfi
         emulator.mmio.phys_write_u32(0x0C00, 0x4C00_0064);
