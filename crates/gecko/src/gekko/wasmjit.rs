@@ -285,20 +285,18 @@ fn emit_with<const SYSTEM: SystemId>(
     end_pc: u32,
     helpers: Helpers,
 ) -> Vec<u8> {
-    let mut body = Function::new([
-        (6, ValType::I32),
-        (2, ValType::F64),
-        (1, ValType::I64),
-        (1, ValType::F32),
-    ]);
-    {
+    // The registers the block touches become locals, known only once it is translated,
+    // so the code is written first and declared after.
+    let mut bytes = Vec::new();
+    let registers = {
         let mut t = Translator::<SYSTEM> {
-            code: body.instructions(),
+            code: InstructionSink::new(&mut bytes),
             helpers,
             ram: sys.mmio.ram_ptr as u32 as u64,
             code_lines: sys.mmio.code_refcount_ptr as u32 as u64,
             pending: 0,
             mask: TRANSLATE.load(core::sync::atomic::Ordering::Relaxed),
+            registers: Registers::default(),
         };
         t.prologue();
         let last = steps.len().saturating_sub(1);
@@ -308,7 +306,20 @@ fn emit_with<const SYSTEM: SystemId>(
         }
         t.exit_const(end_pc);
         t.code.end();
-    }
+        t.registers
+    };
+    let scratch = [
+        (6, ValType::I32),
+        (2, ValType::F64),
+        (1, ValType::I64),
+        (1, ValType::F32),
+    ];
+    let locals: Vec<(u32, ValType)> = scratch
+        .into_iter()
+        .chain(registers.locals.iter().map(|&ty| (1, ty)))
+        .collect();
+    let mut body = Function::new(locals);
+    body.raw(bytes);
 
     let mut types = TypeSection::new();
     let i32s = |n: usize| core::iter::repeat_n(ValType::I32, n);
@@ -405,7 +416,30 @@ struct Translator<'a, const SYSTEM: SystemId> {
     /// before anything that could observe it.
     pending: i64,
     mask: u32,
+    registers: Registers,
 }
+
+/// The console's registers a block has in locals. A register is read from the console
+/// once, written back before anything that could look — a handler, the bus in the
+/// interpreter's hands, the way out — and forgotten after a handler may have changed it.
+#[derive(Default)]
+struct Registers {
+    gprs: [Cached; 32],
+    ps0: [Cached; 32],
+    ps1: [Cached; 32],
+    /// The locals, in the order they were given out, after the fixed scratch ones.
+    locals: Vec<ValType>,
+}
+
+#[derive(Default, Clone, Copy)]
+struct Cached {
+    local: Option<u32>,
+    loaded: bool,
+    dirty: bool,
+}
+
+/// The first local a register may have; the scratch locals come before it.
+const FIRST_REGISTER_LOCAL: u32 = 11;
 
 macro_rules! translate {
     ($self:ident, $op:ident; $($known:ident => $body:expr;)*) => {
@@ -524,6 +558,7 @@ impl<const SYSTEM: SystemId> Translator<'_, SYSTEM> {
     }
 
     fn exit_const(&mut self, pc: u32) {
+        self.write_back(false);
         self.flush_cycles();
         self.code.i32_const(pc as i32).return_();
     }
@@ -531,6 +566,7 @@ impl<const SYSTEM: SystemId> Translator<'_, SYSTEM> {
     /// Leaves with the address the console's `nia` holds. Like `exit_const`, only for a
     /// path every other path has already left: it settles the pending cycles for good.
     fn exit_nia(&mut self) {
+        self.write_back(false);
         self.flush_cycles();
         self.code.local_get(CTX).i32_load(Self::nia()).return_();
     }
@@ -539,6 +575,7 @@ impl<const SYSTEM: SystemId> Translator<'_, SYSTEM> {
     /// and, unless the block ends here anyway, a check that it did not send control away.
     fn call_handler(&mut self, leaf: u16, instr: Instruction, at: u32, expected: u32, last: bool) {
         self.flush_cycles();
+        self.write_back(false);
         self.code
             .local_get(CTX)
             .i32_const(at as i32)
@@ -553,6 +590,7 @@ impl<const SYSTEM: SystemId> Translator<'_, SYSTEM> {
         if last {
             self.exit_nia();
         } else {
+            self.forget_registers();
             self.code
                 .local_get(CTX)
                 .i32_load(Self::nia())
@@ -762,6 +800,7 @@ impl<const SYSTEM: SystemId> Translator<'_, SYSTEM> {
                 $(
                     if op == $known {
                         self.flush_cycles();
+                        self.write_back(false);
                         self.code.local_get(FP_OK).i32_eqz().if_(BlockType::Empty);
                         self.call_handler(leaf, instr, at, expected, true);
                         self.code.end();
@@ -778,6 +817,7 @@ impl<const SYSTEM: SystemId> Translator<'_, SYSTEM> {
                 $(
                     if op == $known {
                         self.flush_cycles();
+                        self.write_back(false);
                         self.code.local_get(FP_OK).i32_eqz().if_(BlockType::Empty);
                         self.call_handler(leaf, instr, at, expected, true);
                         self.code.end();
@@ -986,6 +1026,7 @@ impl<const SYSTEM: SystemId> Translator<'_, SYSTEM> {
                 t.code.i32_const(at.wrapping_add(4) as i32);
             });
         }
+        self.write_back(true);
         self.flush_cycles_keeping();
         self.code.local_get(A).return_().end();
         self.exit_const(expected);
@@ -995,7 +1036,45 @@ impl<const SYSTEM: SystemId> Translator<'_, SYSTEM> {
     // -- registers ------------------------------------------------------------------------
 
     fn load_gpr(&mut self, r: u8) {
-        self.code.local_get(CTX).i32_load(Self::gpr(r));
+        let local = self.gpr_local(r);
+        self.load_gpr_at(r, local);
+    }
+
+    fn gpr_local(&mut self, r: u8) -> u32 {
+        let regs = &mut self.registers;
+        if let Some(local) = regs.gprs[r as usize].local {
+            return local;
+        }
+        let local = FIRST_REGISTER_LOCAL + regs.locals.len() as u32;
+        regs.locals.push(ValType::I32);
+        regs.gprs[r as usize].local = Some(local);
+        local
+    }
+
+    fn fpr_local(&mut self, r: u8, half: u8) -> u32 {
+        let regs = &mut self.registers;
+        let cached = if half == 0 {
+            &mut regs.ps0[r as usize]
+        } else {
+            &mut regs.ps1[r as usize]
+        };
+        if let Some(local) = cached.local {
+            return local;
+        }
+        let local = FIRST_REGISTER_LOCAL + regs.locals.len() as u32;
+        regs.locals.push(ValType::F64);
+        cached.local = Some(local);
+        local
+    }
+
+    fn load_gpr_at(&mut self, r: u8, local: u32) {
+        let cached = &mut self.registers.gprs[r as usize];
+        if cached.loaded {
+            self.code.local_get(local);
+        } else {
+            cached.loaded = true;
+            self.code.local_get(CTX).i32_load(Self::gpr(r)).local_tee(local);
+        }
     }
 
     /// `rA` where zero means the constant, as an address base does.
@@ -1008,9 +1087,59 @@ impl<const SYSTEM: SystemId> Translator<'_, SYSTEM> {
     }
 
     fn store_gpr(&mut self, r: u8, value: impl FnOnce(&mut Self)) {
-        self.code.local_get(CTX);
+        let local = self.gpr_local(r);
         value(self);
-        self.code.i32_store(Self::gpr(r));
+        self.code.local_set(local);
+        self.registers.gprs[r as usize] = Cached {
+            local: Some(local),
+            loaded: true,
+            dirty: true,
+        };
+    }
+
+    /// Every register a local holds that the console does not yet, written to the
+    /// console. `keep` when this path leaves and another still holds them.
+    fn write_back(&mut self, keep: bool) {
+        for r in 0..32u8 {
+            let cached = self.registers.gprs[r as usize];
+            if cached.dirty {
+                self.code
+                    .local_get(CTX)
+                    .local_get(cached.local.unwrap())
+                    .i32_store(Self::gpr(r));
+                self.registers.gprs[r as usize].dirty = keep;
+            }
+            let cached = self.registers.ps0[r as usize];
+            if cached.dirty {
+                self.code
+                    .local_get(CTX)
+                    .local_get(cached.local.unwrap())
+                    .f64_store(Self::fpr(r));
+                self.registers.ps0[r as usize].dirty = keep;
+            }
+            let cached = self.registers.ps1[r as usize];
+            if cached.dirty {
+                self.code
+                    .local_get(CTX)
+                    .local_get(cached.local.unwrap())
+                    .f64_store(Self::ps1(r));
+                self.registers.ps1[r as usize].dirty = keep;
+            }
+        }
+    }
+
+    /// After a handler may have written any register: the locals are stale.
+    fn forget_registers(&mut self) {
+        for r in 0..32 {
+            for cached in [
+                &mut self.registers.gprs[r],
+                &mut self.registers.ps0[r],
+                &mut self.registers.ps1[r],
+            ] {
+                cached.loaded = false;
+                cached.dirty = false;
+            }
+        }
     }
 
     fn store_field(&mut self, field: MemArg, value: impl FnOnce(&mut Self)) {
@@ -1567,34 +1696,70 @@ impl<const SYSTEM: SystemId> Translator<'_, SYSTEM> {
             .local_get(CTX)
             .i32_const(self.helpers.raise_fp)
             .call_indirect(0, T_RAISE);
-        // This path leaves; the cycles it settles are still owed on the other.
+        // This path leaves; what it writes back and settles is still owed on the other.
+        self.write_back(true);
         self.flush_cycles_keeping();
         self.code.local_get(CTX).i32_load(Self::nia()).return_().end().end();
     }
 
     fn load_fpr(&mut self, r: u8) {
-        self.code.local_get(CTX).f64_load(Self::fpr(r));
+        self.load_half(r, 0);
     }
 
     fn load_ps1(&mut self, r: u8) {
-        self.code.local_get(CTX).f64_load(Self::ps1(r));
+        self.load_half(r, 1);
+    }
+
+    fn load_half(&mut self, r: u8, half: u8) {
+        let local = self.fpr_local(r, half);
+        let cached = if half == 0 {
+            &mut self.registers.ps0[r as usize]
+        } else {
+            &mut self.registers.ps1[r as usize]
+        };
+        if cached.loaded {
+            self.code.local_get(local);
+        } else {
+            cached.loaded = true;
+            let at = if half == 0 { Self::fpr(r) } else { Self::ps1(r) };
+            self.code.local_get(CTX).f64_load(at).local_tee(local);
+        }
+    }
+
+    /// The value on the stack into one half of `fD`.
+    fn set_half(&mut self, r: u8, half: u8) {
+        let local = self.fpr_local(r, half);
+        self.code.local_set(local);
+        let cached = if half == 0 {
+            &mut self.registers.ps0[r as usize]
+        } else {
+            &mut self.registers.ps1[r as usize]
+        };
+        *cached = Cached {
+            local: Some(local),
+            loaded: true,
+            dirty: true,
+        };
     }
 
     /// `fD` from the stack, and `ps1` too when the result is single: a single-precision
     /// result lands in both halves.
     fn store_fp_result(&mut self, r: u8, single: bool) {
-        self.code.local_set(F);
-        self.code.local_get(CTX).local_get(F).f64_store(Self::fpr(r));
         if single {
-            self.code.local_get(CTX).local_get(F).f64_store(Self::ps1(r));
+            self.code.local_tee(F);
+            self.set_half(r, 0);
+            self.code.local_get(F);
+            self.set_half(r, 1);
+        } else {
+            self.set_half(r, 0);
         }
     }
 
     /// `fD` from `ps1` on the stack and `ps0` in `F`.
     fn store_ps_pair(&mut self, r: u8) {
-        self.code.local_set(G);
-        self.code.local_get(CTX).local_get(F).f64_store(Self::fpr(r));
-        self.code.local_get(CTX).local_get(G).f64_store(Self::ps1(r));
+        self.set_half(r, 1);
+        self.code.local_get(F);
+        self.set_half(r, 0);
     }
 
     /// The value on the stack rounded the way the multiplier's `fC` input is.
@@ -1948,6 +2113,7 @@ impl<const SYSTEM: SystemId> Translator<'_, SYSTEM> {
             Form::X => (instr.psq_ix(), instr.psq_wx()),
         };
         self.psq_address(instr, form);
+        self.write_back(false);
         self.code
             .local_get(CTX)
             .i32_load(field(abi::gqr_offset::<SYSTEM>(index)))
@@ -1982,7 +2148,15 @@ impl<const SYSTEM: SystemId> Translator<'_, SYSTEM> {
                 t.code.local_get(A);
             });
         }
+        self.merge_paths();
+    }
+
+    /// Ends an `if`/`else` whose one arm called a handler: what this arm holds goes to
+    /// the console, and both arms continue from the console alone.
+    fn merge_paths(&mut self) {
+        self.write_back(false);
         self.code.end();
+        self.forget_registers();
     }
 
     fn psq_store(
@@ -2000,6 +2174,7 @@ impl<const SYSTEM: SystemId> Translator<'_, SYSTEM> {
             Form::X => (instr.psq_ix(), instr.psq_wx()),
         };
         self.psq_address(instr, form);
+        self.write_back(false);
         self.code
             .local_get(CTX)
             .i32_load(field(abi::gqr_offset::<SYSTEM>(index)))
@@ -2026,7 +2201,7 @@ impl<const SYSTEM: SystemId> Translator<'_, SYSTEM> {
                 }
             });
         }
-        self.code.end();
+        self.merge_paths();
     }
 
     fn psq_address(&mut self, instr: Instruction, form: Form) {
@@ -2612,6 +2787,92 @@ mod arithmetic_tests {
             .map(|&xo| x_form(63, xo))
             .collect();
         check_all(&[a, s, x].concat());
+    }
+
+    /// Blocks of several instructions, so that a register read after it was written in
+    /// the same block, and one written twice, come out as the interpreter has them.
+    #[test]
+    fn sequences_agree_with_the_interpreter() {
+        let sequences: [&[u32]; 4] = [
+            // addi r4,r1,5 ; add r5,r4,r4 ; subf r6,r5,r1 ; or r4,r6,r5 ; cmpw r4,r5 ;
+            // rlwinm. r7,r4,3,0,31 ; addic. r4,r4,-1 ; mullw r6,r4,r7 ; mfcr r5
+            &[
+                0x3881_0005,
+                0x7CA4_2214,
+                0x7CC5_0850,
+                0x7CC4_2B78,
+                0x7C04_2800,
+                0x54A7_183F,
+                0x3484_FFFF,
+                0x7CC4_39D6,
+                0x7CA0_0026,
+            ],
+            // fadd f4,f1,f2 ; fmul f5,f4,f3 ; ps_merge01 f6,f4,f5 ; ps_sum0 f7,f6,f5,f4 ; fneg f4,f7 ;
+            // fmr f1,f4 ; fmuls f2,f1,f3 ; ps_madd f3,f2,f1,f7
+            &[
+                0xFC81_102A,
+                0xFCA4_00F2,
+                0x10C4_2C60,
+                0x10E6_2114,
+                0xFC80_3850,
+                0xFC20_2090,
+                0xEC41_00F2,
+                0x1062_3CBA,
+            ],
+            // mtlr r1 ; mfctr r4 ; mtctr r2 ; mflr r5 ; mfxer r6 ; addic r7,r6,1 ; mfxer r6 ; crxor 3,1,2 ; mcrf 1,0
+            &[
+                0x7C28_03A6,
+                0x7C89_02A6,
+                0x7C49_03A6,
+                0x7CA8_02A6,
+                0x7CC1_02A6,
+                0x30E6_0001,
+                0x7CC1_02A6,
+                0x4C61_1182,
+                0x4C80_0000,
+            ],
+            // fcmpu cr1,f1,f2 ; ps_cmpo1 cr2,f2,f3 ; fsel f4,f1,f2,f3 ; ps_nmadd f5,f4,f3,f2 ; frsp f6,f5 ; fctiwz f7,f6
+            &[
+                0xFC81_1000,
+                0x1102_1840,
+                0xFC82_18EE,
+                0x10A4_10FE,
+                0xFCC0_2818,
+                0xFCE0_301E,
+            ],
+        ];
+        let mut failures = Vec::new();
+        let mut seed = 0x9E37_79B9u32;
+        let mut next = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 17;
+            seed ^= seed << 5;
+            seed
+        };
+        for words in sequences {
+            for _ in 0..24 {
+                let mut fprs = [[0.0f64; 2]; 8];
+                for pair in fprs.iter_mut() {
+                    *pair = [
+                        INTERESTING[(next() % INTERESTING.len() as u32) as usize],
+                        INTERESTING[(next() % INTERESTING.len() as u32) as usize],
+                    ];
+                }
+                let mut gprs = [0u32; 8];
+                for gpr in gprs.iter_mut() {
+                    *gpr = INTEGERS[(next() % INTEGERS.len() as u32) as usize];
+                }
+                if let Some(diff) = disagreement(words, &fprs, &gprs, 0) {
+                    failures.push(format!("{words:08x?} from {gprs:x?} {fprs:?}:{diff}"));
+                    break;
+                }
+            }
+        }
+        assert!(
+            failures.is_empty(),
+            "sequences disagree with the interpreter:\n{}",
+            failures.join("\n")
+        );
     }
 
     #[test]
