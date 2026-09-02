@@ -1,4 +1,5 @@
 use crate::dvd::{Apploader, DVD_APPLOADER_OFFSET, DVD_APPLOADER_SIZE, DVD_HEADER_OFFSET, DVD_HEADER_SIZE, Header};
+use std::cell::RefCell;
 use zerocopy::FromBytes;
 
 const RVZ_MAGIC: [u8; 4] = [b'R', b'V', b'Z', 0x01];
@@ -80,7 +81,15 @@ pub struct Rvz {
     partitions: Vec<WiiPartition>,
     data_partition: Option<usize>,
     file_data: Vec<u8>,
+    /// The last few groups decompressed, most recent last. A game reads its disc a
+    /// few kilobytes at a time and a group is a great deal bigger than that, so
+    /// without this every read decompressed the whole group around it again.
+    cache: RefCell<Vec<(u32, Vec<u8>)>>,
 }
+
+/// How many decompressed groups are kept: at the largest chunk size an RVZ can use,
+/// two megabytes, this is sixteen megabytes.
+const GROUP_CACHE_SIZE: usize = 8;
 
 impl Rvz {
     pub fn parse(data: Vec<u8>) -> Self {
@@ -166,6 +175,7 @@ impl Rvz {
                     compression,
                     &raw_data,
                     &groups,
+                    &RefCell::new(Vec::new()),
                     DVD_HEADER_OFFSET as u64,
                     &mut header_bytes,
                 );
@@ -179,6 +189,7 @@ impl Rvz {
                     compression,
                     &raw_data,
                     &groups,
+                    &RefCell::new(Vec::new()),
                     DVD_APPLOADER_OFFSET as u64,
                     &mut apploader_bytes,
                 );
@@ -231,6 +242,7 @@ impl Rvz {
             partitions,
             data_partition,
             file_data: data,
+            cache: RefCell::new(Vec::with_capacity(GROUP_CACHE_SIZE)),
         }
     }
 }
@@ -301,6 +313,7 @@ fn read_into(
     compression: Compression,
     raw_data: &[RawData],
     groups: &[GroupEntry],
+    cache: &RefCell<Vec<(u32, Vec<u8>)>>,
     mut offset: u64,
     buf: &mut [u8],
 ) {
@@ -328,8 +341,24 @@ fn read_into(
         let group_offset_in_data = (group_idx as u64) * (chunk_size as u64);
         let this_chunk_size = core::cmp::min(chunk_size as u64, rd.data_size - group_offset_in_data) as usize;
 
-        let group = &groups[(rd.group_index + group_idx) as usize];
-        let chunk = self::decompress_group(file, group, this_chunk_size, compression, group_offset_in_data);
+        let group_number = rd.group_index + group_idx;
+        let mut cached = cache.borrow_mut();
+        let at = match cached.iter().position(|(number, _)| *number == group_number) {
+            Some(at) => at,
+            None => {
+                let group = &groups[group_number as usize];
+                let chunk = self::decompress_group(file, group, this_chunk_size, compression, group_offset_in_data);
+                if cached.len() == GROUP_CACHE_SIZE {
+                    cached.remove(0);
+                }
+                cached.push((group_number, chunk));
+                cached.len() - 1
+            }
+        };
+        // Most recently used goes last, so the one evicted is the one longest unread.
+        let (_, chunk) = cached.remove(at);
+        cached.push((group_number, chunk));
+        let chunk = &cached.last().unwrap().1;
 
         let byte_off_in_chunk = (within - group_offset_in_data) as usize;
         let avail = this_chunk_size - byte_off_in_chunk;
@@ -460,6 +489,7 @@ fn pick_data_partition(
         compression,
         raw_data,
         groups,
+        &RefCell::new(Vec::new()),
         WII_PARTITION_TABLE_OFFSET,
         &mut group_table,
     );
@@ -480,6 +510,7 @@ fn pick_data_partition(
             compression,
             raw_data,
             groups,
+            &RefCell::new(Vec::new()),
             table_off,
             &mut entries,
         );
@@ -745,6 +776,7 @@ impl crate::Dvd for Rvz {
                 self.compression,
                 &self.raw_data,
                 &self.groups,
+                &self.cache,
                 offset as u64,
                 buf,
             ),
@@ -782,6 +814,7 @@ impl crate::Dvd for Rvz {
             self.compression,
             &self.raw_data,
             &self.groups,
+            &self.cache,
             offset as u64,
             buf,
         );
