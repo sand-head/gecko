@@ -136,21 +136,59 @@ impl Dsp {
     pub fn parked_in_mailbox_wait(&self) -> bool {
         let cpu_mail_quiet = !self.mailbox_to_dsp_hi.busy();
         let dsp_mail_full = self.mailbox_to_cpu_hi.busy();
-        (cpu_mail_quiet && self.is_waiting_for_cpu_mail()) || (dsp_mail_full && self.is_waiting_for_dsp_mail())
+        (cpu_mail_quiet && self.is_waiting_for_cpu_mail())
+            || (dsp_mail_full && self.is_waiting_for_dsp_mail())
+            || self.is_parked_on_dram()
+    }
+
+    /// The Zelda ucode idles on its own DRAM rather than on the mailbox — a flag its
+    /// mail interrupt handler sets, or a ring buffer's read and write words drawing
+    /// level — so it is parked while the words say wait and no interrupt is pending.
+    #[inline(always)]
+    fn is_parked_on_dram(&self) -> bool {
+        let entry = self.wait_table[self.registers.pc as usize];
+        if entry & 0b1100 == 0 || self.csr.pi_interrupt() {
+            return false;
+        }
+        let start = self.registers.pc.wrapping_sub((entry >> 4) as u16);
+        let word = |at: u16| read_word(&*self.dram, self.read_imem(start.wrapping_add(at)));
+        match entry & 0b1100 {
+            0b0100 => word(1) == 0,
+            _ => word(3) == word(5),
+        }
     }
 
     pub fn rebuild_wait_table(&mut self) {
         const SDK_OFFSETS: [i16; 3] = [0, -1, -3];
         const IPL_OFFSETS: [i16; 5] = [0, -1, -2, -3, -5];
+        const ZELDA_MAIL_OFFSETS: [i16; 3] = [0, -2, -4];
+        const ZELDA_FLAG_OFFSETS: [i16; 3] = [0, -2, -3];
+        const ZELDA_RING_OFFSETS: [i16; 6] = [0, -1, -2, -4, -6, -7];
 
         for pc in 0u32..0x10000 {
             let pc = pc as u16;
 
             let cpu = SDK_OFFSETS.iter().any(|&o| self.matches_cpu_mail_wait_at(pc, o))
-                || IPL_OFFSETS.iter().any(|&o| self.matches_ipl_cpu_mail_wait_at(pc, o));
+                || IPL_OFFSETS.iter().any(|&o| self.matches_ipl_cpu_mail_wait_at(pc, o))
+                || ZELDA_MAIL_OFFSETS
+                    .iter()
+                    .any(|&o| self.matches_zelda_cpu_mail_wait_at(pc, o));
             let dsp = SDK_OFFSETS.iter().any(|&o| self.matches_dsp_mail_wait_at(pc, o));
+            // Bits 2-3 say which DRAM wait, bits 4.. how far back the loop starts, so
+            // the addresses it polls can be read from the loads at its head.
+            let dram = ZELDA_FLAG_OFFSETS
+                .iter()
+                .find(|&&o| self.matches_zelda_flag_wait_at(pc, o))
+                .map(|&o| 0b0100 | ((-o as u8) << 4))
+                .or_else(|| {
+                    ZELDA_RING_OFFSETS
+                        .iter()
+                        .find(|&&o| self.matches_zelda_ring_wait_at(pc, o))
+                        .map(|&o| 0b1000 | ((-o as u8) << 4))
+                })
+                .unwrap_or(0);
 
-            self.wait_table[pc as usize] = (cpu as u8) | ((dsp as u8) << 1);
+            self.wait_table[pc as usize] = (cpu as u8) | ((dsp as u8) << 1) | dram;
         }
     }
 
@@ -164,10 +202,39 @@ impl Dsp {
         words == pattern_a || words == pattern_b || words == pattern_c || words == pattern_d
     }
 
+    // LR $AC0.M, @CMBH; ANDCF; JLNZ — the same wait as the Zelda ucode spells it.
+    fn matches_zelda_cpu_mail_wait_at(&self, pc: u16, offset: i16) -> bool {
+        let start = pc.wrapping_add_signed(offset);
+        let words = self.read_imem_window::<6>(start);
+        words == [0x00DE, 0xFFFE, 0x02C0, 0x8000, 0x029C, start]
+    }
+
     fn matches_ipl_cpu_mail_wait_at(&self, pc: u16, offset: i16) -> bool {
         let start = pc.wrapping_add_signed(offset);
         let words = self.read_imem_window::<7>(start);
         words == [0x8100, 0x8900, 0x26FE, 0x02C0, 0x8000, 0x029C, start]
+    }
+
+    // LR $AX0.H, @0x0352; TST $ACC0; JZ — the Zelda ucode waiting for its handler, as
+    // Dolphin's analyzer knows it.
+    fn matches_zelda_flag_wait_at(&self, pc: u16, offset: i16) -> bool {
+        let start = pc.wrapping_add_signed(offset);
+        let words = self.read_imem_window::<4>(start);
+        words == [0x00DA, 0x0352, 0x8600, 0x0295]
+    }
+
+    // CLR $ACC0; CLR $ACC1; LR $AC1.M, @read; LR $AC0.M, @write; CMP; JEQ back — the
+    // Zelda ucode waiting for its command ring to fill.
+    fn matches_zelda_ring_wait_at(&self, pc: u16, offset: i16) -> bool {
+        let start = pc.wrapping_add_signed(offset);
+        let words = self.read_imem_window::<9>(start);
+        words[0] == 0x8100
+            && words[1] == 0x8900
+            && words[2] == 0x00DF
+            && words[4] == 0x00DE
+            && words[6] == 0x8200
+            && words[7] == 0x0293
+            && words[8] == start
     }
 
     fn matches_dsp_mail_wait_at(&self, pc: u16, offset: i16) -> bool {
@@ -304,7 +371,6 @@ impl<const SYSTEM: SystemId> System<SYSTEM> {
         if self.dsp.csr.reset() || self.dsp.csr.halt() {
             return false;
         }
-
         if self.dsp.csr.pi_interrupt() && self.dsp.registers.status.external_interrupt_enable() {
             self.dsp.csr = self.dsp.csr.with_pi_interrupt(false);
             self.dsp.registers.call_stack.push(self.dsp.registers.pc);
