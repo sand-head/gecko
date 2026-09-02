@@ -86,6 +86,27 @@ fn resolvers_for(lut: &str) -> String {
     for (i, leaf) in leaves.iter().enumerate() {
         out.push_str(&format!("        {i} => {leaf}(ctx, instr),\n"));
     }
-    out.push_str("        _ => _unimpl(ctx, instr),\n    }\n}\n");
+    out.push_str("        _ => _unimpl(ctx, instr),\n    }\n}\n\n");
+    out.push_str(
+        "/// Handler number `leaf` itself, for a caller that will call it more than once.\n#[inline(always)]\npub fn handler(leaf: u16) -> Handler {\n    match leaf {\n",
+    );
+    for (i, leaf) in leaves.iter().enumerate() {
+        out.push_str(&format!("        {i} => {leaf},\n"));
+    }
+    out.push_str("        _ => _unimpl,\n    }\n}\n\n");
+    out.push_str(
+        "/// The `OP_*` constant handler number `leaf` is specialised on, which names the instruction; `u32::MAX` for a handler that has none.\n#[inline(always)]\npub fn op_of(leaf: u16) -> u32 {\n    match leaf {\n",
+    );
+    for (i, leaf) in leaves.iter().enumerate() {
+        if let Some(op) = leaf
+            .split("::<{ ")
+            .nth(1)
+            .and_then(|rest| rest.split(' ').next())
+            .filter(|op| op.starts_with("OP_"))
+        {
+            out.push_str(&format!("        {i} => {op},\n"));
+        }
+    }
+    out.push_str("        _ => u32::MAX,\n    }\n}\n");
     out
 }

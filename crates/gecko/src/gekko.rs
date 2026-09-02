@@ -1,3 +1,4 @@
+pub mod abi;
 pub mod block;
 pub mod cache;
 pub mod condition;
@@ -14,6 +15,8 @@ pub mod jit;
 pub mod msr;
 pub mod spr;
 pub mod sr;
+#[cfg(feature = "wasm-jit")]
+pub mod wasmjit;
 
 use crate::gekko::condition::ConditionRegister;
 
@@ -199,6 +202,26 @@ pub fn execute<const SYSTEM: crate::system::SystemId>(
     } else {
         let ctx: &mut crate::wii::Wii = unsafe { core::mem::transmute(ctx) };
         self::lut_wii::execute(leaf, ctx, instr);
+    }
+}
+
+/// Where handler number `leaf` is: on wasm32 a function pointer is an index into the
+/// module's function table, which is what a compiled block calls it by.
+pub fn handler_address<const SYSTEM: crate::system::SystemId>(leaf: u16) -> usize {
+    if SYSTEM == crate::system::GC {
+        self::lut::handler(leaf) as usize
+    } else {
+        self::lut_wii::handler(leaf) as usize
+    }
+}
+
+/// The `OP_*` constant naming the instruction handler number `leaf` handles, or
+/// `u32::MAX` for a handler that is not specialised on one.
+pub fn op_of<const SYSTEM: crate::system::SystemId>(leaf: u16) -> u32 {
+    if SYSTEM == crate::system::GC {
+        self::lut::op_of(leaf)
+    } else {
+        self::lut_wii::op_of(leaf)
     }
 }
 

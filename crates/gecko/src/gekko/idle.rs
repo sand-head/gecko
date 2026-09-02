@@ -36,9 +36,9 @@ fn classify_pointer_iter_loop(spec: &BlockSpec) -> Option<IdleClass> {
         return None;
     }
 
-    let i0 = crate::gekko::instruction::Instruction(spec.instrs[0]);
-    let i1 = crate::gekko::instruction::Instruction(spec.instrs[1]);
-    let i2 = crate::gekko::instruction::Instruction(spec.instrs[2]);
+    let i0 = Instruction(spec.instrs[0]);
+    let i1 = Instruction(spec.instrs[1]);
+    let i2 = Instruction(spec.instrs[2]);
 
     if !self::is_cache_op_no_side_effect(i0) {
         return None;
@@ -99,7 +99,7 @@ fn classify_branch_to_self(spec: &BlockSpec) -> Option<IdleClass> {
         return None;
     }
 
-    let instr = crate::gekko::instruction::Instruction(spec.instrs[0]);
+    let instr = Instruction(spec.instrs[0]);
     if instr.lk() {
         return None;
     }
@@ -134,7 +134,7 @@ fn classify_polling_loop(spec: &BlockSpec) -> bool {
         return false;
     }
 
-    let term = crate::gekko::instruction::Instruction(spec.instrs[last_idx]);
+    let term = Instruction(spec.instrs[last_idx]);
     let term_pc = spec.start_pc.wrapping_add((last_idx as u32) * 4);
     if !is_idle_loop_terminator(term, term_pc, spec.start_pc) {
         return false;
@@ -174,7 +174,7 @@ pub fn validate_idle_loop(body: &[u32]) -> bool {
     let mut written: u32 = 0;
 
     for &raw in body {
-        let (reads, writes) = match gpr_dataflow(crate::gekko::instruction::Instruction(raw)) {
+        let (reads, writes) = match gpr_dataflow(Instruction(raw)) {
             Some(p) => p,
             None => return false,
         };

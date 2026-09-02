@@ -1,4 +1,4 @@
-pub mod abi;
+pub use crate::gekko::abi;
 pub mod handlers;
 pub mod insn;
 pub mod runtime;
@@ -16,16 +16,16 @@ pub mod lut_wii {
     include!(concat!(env!("OUT_DIR"), "/gekko_jit_lut_wii.rs"));
 }
 
-use cranelift_codegen::Context;
-use cranelift_codegen::ir::{AbiParam, InstBuilder, Signature, types};
+use cranelift_codegen::ir::{types, AbiParam, InstBuilder, Signature};
 use cranelift_codegen::isa::CallConv;
 use cranelift_codegen::settings::{self, Configurable};
+use cranelift_codegen::Context;
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext};
 use cranelift_jit::{JITBuilder, JITModule};
-use cranelift_module::{FuncId, Linkage, Module, default_libcall_names};
+use cranelift_module::{default_libcall_names, FuncId, Linkage, Module};
 use rustc_hash::FxHashMap;
 
-use crate::system::{GC, System, SystemId, WII};
+use crate::system::{System, SystemId, GC, WII};
 
 pub type BlockEntry = usize;
 
