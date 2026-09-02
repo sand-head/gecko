@@ -1,8 +1,11 @@
 //! Blocks compiled to WebAssembly, for a host that is WebAssembly itself and can run
-//! nothing else. Each block becomes a module of one function that imports the host's
-//! memory and function table, so it reads the console where the interpreter does and
-//! calls what the interpreter calls. The host instantiates it and puts the function in a
-//! slot of its own table, and to Rust on wasm32 a slot is a function pointer.
+//! nothing else. Each block becomes a function; a batch of them becomes a module that
+//! imports the host's memory and function table, so a block reads the console where the
+//! interpreter does and calls what the interpreter calls. The host instantiates the
+//! module and puts each function in a slot of its own table, and to Rust on wasm32 a
+//! slot is a function pointer. Batching is not a nicety: a browser gives every module
+//! its own page of executable memory, and a game that compiles fifty thousand blocks
+//! one module each runs the browser out of it.
 //!
 //! The emitter knows an instruction by the handler the resolver picked for it, which the
 //! generated tables name by its `OP_*` constant, and translates the ones worth
@@ -31,20 +34,21 @@ use crate::system::{System, SystemId};
 /// load/store, 8192 psq load, 16384 branch, 32768 psq store.
 pub static TRANSLATE: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(u32::MAX);
 
-/// The host's side of the bargain: module bytes in, a slot of its function table out.
+/// The host's side of the bargain: a module of `functions` blocks in, a slot of its
+/// function table for each out, in the module's order; and a slot back when its block
+/// is forgotten, so that what it held can go.
 pub trait BlockCompiler {
-    fn compile(&mut self, module: &[u8]) -> Option<u32>;
+    fn compile(&mut self, module: &[u8], functions: usize) -> Option<Vec<u32>>;
     fn release(&mut self, slot: u32);
 }
 
 /// What a slot holds: the console in, the address control went to out.
 pub type BlockFn<const SYSTEM: SystemId> = extern "C" fn(*mut System<SYSTEM>) -> u32;
 
-/// The module's imports, and the name of the one function it exports.
+/// The module's imports. Its functions are exported by their index, as decimal.
 pub const IMPORT_MODULE: &str = "e";
 pub const MEMORY_IMPORT: &str = "m";
 pub const TABLE_IMPORT: &str = "t";
-pub const BLOCK_EXPORT: &str = "b";
 
 // The module's function types, in the order the type section declares them.
 const T_BLOCK: u32 = 0;
@@ -271,11 +275,11 @@ impl Helpers {
 
 // ---- the module -------------------------------------------------------------------
 
-/// Emits the module for a block, given each instruction's handler, word and address in
-/// the order they run, and the address after the last. `sys` is the console the block
+/// Emits the function for a block, given each instruction's handler, word and address
+/// in the order they run, and the address after the last. `sys` is the console the block
 /// will run on: RAM and the code-line counts never move, so their addresses are baked in
 /// (truncated to what a 32-bit memory can hold, which on wasm32 they already are).
-pub fn emit<const SYSTEM: SystemId>(sys: &System<SYSTEM>, steps: &[(u16, Instruction, u32)], end_pc: u32) -> Vec<u8> {
+pub fn emit<const SYSTEM: SystemId>(sys: &System<SYSTEM>, steps: &[(u16, Instruction, u32)], end_pc: u32) -> Function {
     emit_with(sys, steps, end_pc, Helpers::for_system::<SYSTEM>())
 }
 
@@ -284,7 +288,7 @@ fn emit_with<const SYSTEM: SystemId>(
     steps: &[(u16, Instruction, u32)],
     end_pc: u32,
     helpers: Helpers,
-) -> Vec<u8> {
+) -> Function {
     // The registers the block touches become locals, known only once it is translated,
     // so the code is written first and declared after.
     let mut bytes = Vec::new();
@@ -320,7 +324,23 @@ fn emit_with<const SYSTEM: SystemId>(
         .collect();
     let mut body = Function::new(locals);
     body.raw(bytes);
+    body
+}
 
+/// A block-shaped function that only traps, for a slot with no block in it.
+pub fn trap() -> Function {
+    let mut body = Function::new([]);
+    body.instructions().unreachable().end();
+    body
+}
+
+/// The module holding these blocks, exported as `"0"`, `"1"`, ... in order.
+pub fn assemble(blocks: &[Function]) -> Vec<u8> {
+    let refs: Vec<&Function> = blocks.iter().collect();
+    assemble_refs(&refs)
+}
+
+pub fn assemble_refs(blocks: &[&Function]) -> Vec<u8> {
     let mut types = TypeSection::new();
     let i32s = |n: usize| core::iter::repeat_n(ValType::I32, n);
     types.ty().function(i32s(1), [ValType::I32]);
@@ -357,11 +377,13 @@ fn emit_with<const SYSTEM: SystemId>(
         }),
     );
     let mut functions = FunctionSection::new();
-    functions.function(T_BLOCK);
     let mut exports = ExportSection::new();
-    exports.export(BLOCK_EXPORT, ExportKind::Func, 0);
     let mut codes = CodeSection::new();
-    codes.function(&body);
+    for (i, block) in blocks.iter().enumerate() {
+        functions.function(T_BLOCK);
+        exports.export(&i.to_string(), ExportKind::Func, i as u32);
+        codes.function(block);
+    }
 
     let mut module = Module::new();
     module
@@ -2264,7 +2286,7 @@ mod tests {
     fn validate(words: &[u32]) {
         let sys = crate::gamecube::GameCube::new(0x8000_3000);
         let steps = steps(words, 0x8000_3000);
-        let module = emit::<GC>(&sys, &steps, 0x8000_3000 + 4 * words.len() as u32);
+        let module = assemble(&[emit::<GC>(&sys, &steps, 0x8000_3000 + 4 * words.len() as u32)]);
         wasmparser::validate(&module).expect("the emitted module is valid");
     }
 
@@ -2467,7 +2489,11 @@ mod tests {
     /// touches memory has one for the bus, and a handler call is one.
     fn calls(words: &[u32]) -> usize {
         let sys = crate::gamecube::GameCube::new(0x8000_3000);
-        let module = emit::<GC>(&sys, &steps(words, 0x8000_3000), 0x8000_3000 + 4 * words.len() as u32);
+        let module = assemble(&[emit::<GC>(
+            &sys,
+            &steps(words, 0x8000_3000),
+            0x8000_3000 + 4 * words.len() as u32,
+        )]);
         let mut calls = 0;
         for payload in wasmparser::Parser::new(0).parse_all(&module) {
             if let wasmparser::Payload::CodeSectionEntry(body) = payload.expect("parses") {
@@ -2519,7 +2545,11 @@ mod tests {
                 0x4182_0030,
             ];
             let steps = steps(&words, 0x8000_3000);
-            std::fs::write(path, emit::<GC>(&sys, &steps, 0x8000_3000 + 4 * words.len() as u32)).unwrap();
+            std::fs::write(
+                path,
+                assemble(&[emit::<GC>(&sys, &steps, 0x8000_3000 + 4 * words.len() as u32)]),
+            )
+            .unwrap();
         }
     }
 
@@ -2646,9 +2676,9 @@ mod arithmetic_tests {
             fma: FMA_SLOT,
             note_store: 0,
         };
-        let module = wasmi::Module::new(&engine, emit_with::<GC>(&sys, &steps, end, helpers)).unwrap();
+        let module = wasmi::Module::new(&engine, assemble(&[emit_with::<GC>(&sys, &steps, end, helpers)])).unwrap();
         let instance = linker.instantiate_and_start(&mut store, &module).unwrap();
-        let block = instance.get_typed_func::<i32, i32>(&store, BLOCK_EXPORT).unwrap();
+        let block = instance.get_typed_func::<i32, i32>(&store, "0").unwrap();
         let nia = block.call(&mut store, CTX as i32).unwrap();
 
         for &(leaf, instr, at) in &steps {

@@ -1,4 +1,4 @@
-use crate::{GxRenderer, PendingWriteback, align_up, compute_draw_buffer_layout};
+use crate::{align_up, compute_draw_buffer_layout, GxRenderer, PendingWriteback};
 use gecko::common::Address;
 use gecko::flipper::gx::texture::{self, CopyFormat};
 use gecko::host::XfbPart;
@@ -1093,13 +1093,12 @@ impl GxRenderer {
         queue: &wgpu::Queue,
         ram: &mut gecko::mmio::RamViewMut<'_>,
     ) {
-        if self.pending_writebacks.is_empty() {
+        let pending = self.take_pending_writebacks(queue);
+        if pending.is_empty() {
             return;
         }
 
-        self.submit_pending(queue);
-
-        for pending in &self.pending_writebacks {
+        for pending in &pending {
             pending
                 .staging
                 .slice(..pending.staging_size)
@@ -1112,59 +1111,74 @@ impl GxRenderer {
         }) {
             tracing::warn!(?err, "efb writeback drain: device poll failed");
             // Best-effort: drop the buffers back into the pool so we don't leak.
-            let pending: Vec<PendingWriteback> = self.pending_writebacks.drain(..).collect();
             for w in pending {
                 self.return_readback_staging(w.staging, w.staging_capacity);
             }
             return;
         }
 
-        let pending: Vec<PendingWriteback> = self.pending_writebacks.drain(..).collect();
         for w in pending {
-            let mut rgba = vec![0u8; (w.width * w.height * 4) as usize];
-            {
-                let slice = w.staging.slice(..w.staging_size);
-                let mapped = slice.get_mapped_range();
-                let row_bytes = (w.width * 4) as usize;
-                let src_row_bytes = w.bytes_per_row as usize;
-
-                for y in 0..w.height as usize {
-                    let src_row = &mapped[y * src_row_bytes..y * src_row_bytes + row_bytes];
-                    let dst_row = &mut rgba[y * row_bytes..y * row_bytes + row_bytes];
-
-                    if w.swap_bgra {
-                        for i in 0..w.width as usize {
-                            dst_row[i * 4] = src_row[i * 4 + 2];
-                            dst_row[i * 4 + 1] = src_row[i * 4 + 1];
-                            dst_row[i * 4 + 2] = src_row[i * 4];
-                            dst_row[i * 4 + 3] = src_row[i * 4 + 3];
-                        }
-                    } else {
-                        dst_row.copy_from_slice(src_row);
-                    }
-                }
-            }
+            let mapped = w.staging.slice(..w.staging_size).get_mapped_range().to_vec();
             w.staging.unmap();
-
-            let (encode_w, encode_h, encode_src) = if w.box_filter_downsample {
-                (
-                    w.width / 2,
-                    w.height / 2,
-                    texture::downsample_box_2x(&rgba, w.width, w.height),
-                )
-            } else {
-                (w.width, w.height, rgba)
-            };
-
-            let encoded = texture::encode_from_rgba(&encode_src, encode_w as usize, encode_h as usize, w.copy_format);
-            let row_bytes = texture::encoded_row_bytes(encode_w, w.copy_format);
-            let row_count = texture::encoded_row_count(encode_h, w.copy_format);
-            let dest_stride_bytes = w.stride as usize;
-
-            texture::write_strided_copy_to_ram(ram, w.dest_addr, &encoded, row_bytes, row_count, dest_stride_bytes);
-
-            self.return_readback_staging(w.staging, w.staging_capacity);
+            self.finish_writeback(w, &mapped, ram);
         }
+    }
+
+    /// The EFB copies to RAM queued so far, submitted and handed over: a host that
+    /// cannot wait on the device (a browser) maps each one itself and brings it back
+    /// to `finish_writeback` once it has.
+    pub fn take_pending_writebacks(&mut self, queue: &wgpu::Queue) -> Vec<PendingWriteback> {
+        if self.pending_writebacks.is_empty() {
+            return Vec::new();
+        }
+        self.submit_pending(queue);
+        self.pending_writebacks.drain(..).collect()
+    }
+
+    /// A copy that never mapped: nothing to put anywhere, but the buffer is still good.
+    pub fn discard_writeback(&mut self, w: PendingWriteback) {
+        self.return_readback_staging(w.staging, w.staging_capacity);
+    }
+
+    /// Puts a mapped copy where the game expects it, in the format it asked for, and
+    /// keeps the staging buffer for the next one.
+    pub fn finish_writeback(&mut self, w: PendingWriteback, mapped: &[u8], ram: &mut gecko::mmio::RamViewMut<'_>) {
+        let mut rgba = vec![0u8; (w.width * w.height * 4) as usize];
+        let row_bytes = (w.width * 4) as usize;
+        let src_row_bytes = w.bytes_per_row as usize;
+        for y in 0..w.height as usize {
+            let src_row = &mapped[y * src_row_bytes..y * src_row_bytes + row_bytes];
+            let dst_row = &mut rgba[y * row_bytes..y * row_bytes + row_bytes];
+            if w.swap_bgra {
+                for i in 0..w.width as usize {
+                    dst_row[i * 4] = src_row[i * 4 + 2];
+                    dst_row[i * 4 + 1] = src_row[i * 4 + 1];
+                    dst_row[i * 4 + 2] = src_row[i * 4];
+                    dst_row[i * 4 + 3] = src_row[i * 4 + 3];
+                }
+            } else {
+                dst_row.copy_from_slice(src_row);
+            }
+        }
+
+        let (encode_w, encode_h, encode_src) = if w.box_filter_downsample {
+            (
+                w.width / 2,
+                w.height / 2,
+                texture::downsample_box_2x(&rgba, w.width, w.height),
+            )
+        } else {
+            (w.width, w.height, rgba)
+        };
+
+        let encoded = texture::encode_from_rgba(&encode_src, encode_w as usize, encode_h as usize, w.copy_format);
+        let row_bytes = texture::encoded_row_bytes(encode_w, w.copy_format);
+        let row_count = texture::encoded_row_count(encode_h, w.copy_format);
+        let dest_stride_bytes = w.stride as usize;
+
+        texture::write_strided_copy_to_ram(ram, w.dest_addr, &encoded, row_bytes, row_count, dest_stride_bytes);
+
+        self.return_readback_staging(w.staging, w.staging_capacity);
     }
 
     fn ensure_draw_capacity(&mut self, count: usize) {

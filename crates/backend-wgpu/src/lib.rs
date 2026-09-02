@@ -399,7 +399,10 @@ pub(crate) struct DrawRecord {
     pub packed_vertex_stride: u32,
 }
 
-pub(crate) struct PendingWriteback {
+/// An EFB copy to RAM on its way: the GPU has been asked to put the pixels in
+/// `staging`, and once they are mapped `finish_writeback` puts them where the game
+/// expects them.
+pub struct PendingWriteback {
     pub dest_addr: Address,
     pub staging: wgpu::Buffer,
     pub staging_capacity: u64,

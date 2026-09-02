@@ -42,6 +42,23 @@ struct Block<const SYSTEM: SystemId> {
 #[cfg(feature = "wasm-jit")]
 const HOT: u32 = 16;
 
+/// Hot blocks are compiled a module at a time, this many to a module, or fewer when the
+/// first has waited this many block runs: a browser gives every module its own page of
+/// executable memory, and one block a page runs it out.
+#[cfg(feature = "wasm-jit")]
+const BATCH: usize = 32;
+#[cfg(feature = "wasm-jit")]
+const BATCH_PATIENCE: u32 = 4096;
+
+/// A block emitted and waiting for its module: which block, at which pc, so that one
+/// forgotten in the meantime is left out.
+#[cfg(feature = "wasm-jit")]
+struct Pending {
+    index: u32,
+    start_pc: u32,
+    function: wasm_encoder::Function,
+}
+
 pub struct BlockCache<const SYSTEM: SystemId> {
     /// Direct-mapped by pc, ahead of the map, as the JIT's lookup table is.
     lookup: Box<[u32]>,
@@ -51,6 +68,10 @@ pub struct BlockCache<const SYSTEM: SystemId> {
     blocks_by_line: FxHashMap<u32, SmallVec<[u32; 2]>>,
     #[cfg(feature = "wasm-jit")]
     compiler: Option<Box<dyn BlockCompiler>>,
+    #[cfg(feature = "wasm-jit")]
+    pending: Vec<Pending>,
+    #[cfg(feature = "wasm-jit")]
+    waited: u32,
 }
 
 impl<const SYSTEM: SystemId> Default for BlockCache<SYSTEM> {
@@ -63,6 +84,10 @@ impl<const SYSTEM: SystemId> Default for BlockCache<SYSTEM> {
             blocks_by_line: FxHashMap::default(),
             #[cfg(feature = "wasm-jit")]
             compiler: None,
+            #[cfg(feature = "wasm-jit")]
+            pending: Vec::new(),
+            #[cfg(feature = "wasm-jit")]
+            waited: 0,
         }
     }
 }
@@ -86,10 +111,22 @@ impl<const SYSTEM: SystemId> BlockCache<SYSTEM> {
             if block.code.is_none() && self.compiler.is_some() {
                 block.runs += 1;
                 if block.runs == HOT {
-                    let compiler = self.compiler.as_mut().unwrap();
-                    block.code = compiler.compile(&wasmjit::emit::<SYSTEM>(sys, &block.steps, block.end_pc));
+                    let function = wasmjit::emit::<SYSTEM>(sys, &block.steps, block.end_pc);
+                    let start_pc = block.start_pc;
+                    self.pending.push(Pending {
+                        index,
+                        start_pc,
+                        function,
+                    });
+                }
+                if !self.pending.is_empty() {
+                    self.waited += 1;
+                    if self.pending.len() >= BATCH || self.waited >= BATCH_PATIENCE {
+                        self.compile_pending();
+                    }
                 }
             }
+            let block = self.blocks[index as usize].as_mut().unwrap();
             if let Some(slot) = block.code {
                 let run: wasmjit::BlockFn<SYSTEM> = unsafe { core::mem::transmute(slot as usize) };
                 if wasmjit::validate::on() {
@@ -116,6 +153,37 @@ impl<const SYSTEM: SystemId> BlockCache<SYSTEM> {
         }
 
         self.interpret(sys, index)
+    }
+
+    /// The blocks waiting, as one module; a block forgotten since it was emitted is left
+    /// out, and one the host could not place stays interpreted.
+    #[cfg(feature = "wasm-jit")]
+    fn compile_pending(&mut self) {
+        self.waited = 0;
+        let pending: Vec<Pending> = self
+            .pending
+            .drain(..)
+            .filter(|p| {
+                self.blocks[p.index as usize]
+                    .as_ref()
+                    .is_some_and(|b| b.start_pc == p.start_pc && b.code.is_none())
+            })
+            .collect();
+        if pending.is_empty() {
+            return;
+        }
+        let functions: Vec<&wasm_encoder::Function> = pending.iter().map(|p| &p.function).collect();
+        let module = wasmjit::assemble_refs(&functions);
+        let Some(compiler) = self.compiler.as_mut() else {
+            return;
+        };
+        if let Some(slots) = compiler.compile(&module, pending.len()) {
+            for (p, slot) in pending.iter().zip(slots) {
+                if let Some(block) = self.blocks[p.index as usize].as_mut() {
+                    block.code = Some(slot);
+                }
+            }
+        }
     }
 
     fn interpret(&self, sys: &mut System<SYSTEM>, index: u32) -> bool {
