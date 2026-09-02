@@ -2497,6 +2497,33 @@ mod tests {
     }
 
     #[test]
+    fn dump_a_block_for_reading() {
+        if let Ok(path) = std::env::var("WASMJIT_DUMP") {
+            let sys = crate::gamecube::GameCube::new(0x8000_3000);
+            // lwz r4,12(r30) ; lis r3,0xcc00 ; mulli r0,r31,20 ; rlwinm r4,r4,0,30,28 ; addi r3,r3,0x6800 ;
+            // stw r4,12(r30) ; add r3,r3,r0 ; lwz r29,0(r3) ; andi. r0,r29,0x405 ; stw r0,0(r3) ;
+            // lwz r0,12(r30) ; rlwinm. r0,r0,0,28,28 ; beq +48
+            let words = [
+                0x809e_000c,
+                0x3c60_cc00,
+                0x1c1f_0014,
+                0x5484_07b8,
+                0x3863_6800,
+                0x909e_000c,
+                0x7c63_0214,
+                0x83a3_0000,
+                0x73a0_0405,
+                0x9003_0000,
+                0x801e_000c,
+                0x5400_0739,
+                0x4182_0030,
+            ];
+            let steps = steps(&words, 0x8000_3000);
+            std::fs::write(path, emit::<GC>(&sys, &steps, 0x8000_3000 + 4 * words.len() as u32)).unwrap();
+        }
+    }
+
+    #[test]
     fn handler_calls_validate() {
         // sc ; rfi
         validate(&[0x4400_0002, 0x4C00_0064]);
