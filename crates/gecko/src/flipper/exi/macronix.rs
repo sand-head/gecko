@@ -14,6 +14,11 @@ const SRAM_SIZE: usize = 64;
 const RTC_START: u32 = 0x840000;
 const RTC_END: u32 = 0x840004;
 
+/// Seconds since 2000-01-01 as the console's clock reads them. A browser build has no
+/// wall clock to read and must not want one: the host counts frames and sets this.
+#[cfg(target_arch = "wasm32")]
+pub static RTC_SECONDS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
 pub struct ExiMacronix {
     rom: Vec<u8>,
     sram: Sram,
@@ -62,6 +67,12 @@ impl ExiMacronix {
         self.command & 0x8000_0000 != 0
     }
 
+    #[cfg(target_arch = "wasm32")]
+    fn rtc_seconds() -> u32 {
+        RTC_SECONDS.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
     fn rtc_seconds() -> u32 {
         use std::time::{SystemTime, UNIX_EPOCH};
         const GC_EPOCH_OFFSET: u64 = 946_684_800;
