@@ -2,6 +2,16 @@ include!(concat!(env!("OUT_DIR"), "/gekko_instr.rs"));
 
 impl Instruction {
     #[inline(always)]
+    pub fn primary_opcode(&self) -> u8 {
+        (self.0 >> 26) as u8
+    }
+
+    #[inline(always)]
+    pub fn xo10(&self) -> u32 {
+        (self.0 >> 1) & 0x3FF
+    }
+
+    #[inline(always)]
     pub fn disp(&self) -> i32 {
         self.d_16_31()
     }

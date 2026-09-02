@@ -761,7 +761,37 @@ impl<const SYSTEM: SystemId> System<SYSTEM> {
     fn run_until_deadline_interp(&mut self) {
         while self.scheduler.cycles < self.scheduler.next_deadline() {
             self.step_cpu();
+            if self.gekko.pc <= self.gekko.cia && self.interp_closed_idle_loop() {
+                let deadline = self.scheduler.next_deadline();
+                if self.scheduler.cycles < deadline {
+                    self.scheduler.cycles = deadline;
+                }
+            }
         }
+    }
+
+    /// Whether the instruction just executed branched back over an idle loop — the
+    /// same loops the JIT classifies, seen one branch at a time: `cia` went back to
+    /// `pc`, and the body between reads only what an interrupt or a DMA could change.
+    fn interp_closed_idle_loop(&self) -> bool {
+        use crate::gekko::idle;
+        let (start, end) = (self.gekko.pc, self.gekko.cia);
+        let body_len = ((end - start) / 4) as usize;
+        if body_len > idle::MAX_IDLE_BODY {
+            return false;
+        }
+        let terminator = crate::gekko::instruction::Instruction(self.mmio.fetch_instruction(end));
+        if body_len == 0 {
+            return idle::is_branch_to_self(terminator, end);
+        }
+        if !idle::is_idle_loop_terminator(terminator, end, start) {
+            return false;
+        }
+        let mut body = [0u32; idle::MAX_IDLE_BODY];
+        for (i, word) in body[..body_len].iter_mut().enumerate() {
+            *word = self.mmio.fetch_instruction(start + (i as u32) * 4);
+        }
+        idle::validate_idle_loop(&body[..body_len])
     }
 
     /// JIT inner loop: runs compiled blocks back-to-back until
