@@ -22,7 +22,6 @@ impl<const SYSTEM: SystemId> System<SYSTEM> {
         let bits = val.to_bits();
         if phys <= RAM_END - 7 {
             self.mmio.ram_write_u64(phys, bits);
-            #[cfg(feature = "jit")]
             self.mmio.queue_icbi_for_range(phys, 8);
             return;
         }

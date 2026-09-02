@@ -49,12 +49,9 @@ pub fn spr<const OP: u32, const SYSTEM: SystemId>(ctx: &mut System<SYSTEM>, inst
                         let dmau = ctx.gekko.spr.dmau;
                         let dmal = ctx.gekko.spr.dmal;
                         let written = ctx.mmio.process_locked_cache_dma(&dmau, &dmal);
-                        #[cfg(feature = "jit")]
                         if let Some((phys, len)) = written {
                             ctx.mmio.queue_icbi_for_range(phys, len);
                         }
-                        #[cfg(not(feature = "jit"))]
-                        let _ = written;
                         ctx.gekko.spr.dmal.set_trigger(false);
                     }
                 }

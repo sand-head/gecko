@@ -1,10 +1,10 @@
 pub mod abi;
-pub mod block;
 pub mod handlers;
-pub mod idle;
 pub mod insn;
 pub mod runtime;
 pub mod translator;
+
+pub use crate::gekko::{block, idle};
 
 #[allow(dead_code, unused_variables, non_upper_case_globals, clippy::all)]
 pub mod lut {

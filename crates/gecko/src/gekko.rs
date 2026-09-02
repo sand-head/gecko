@@ -1,3 +1,5 @@
+pub mod block;
+pub mod cache;
 pub mod condition;
 pub mod cycles;
 pub mod dec;
@@ -18,11 +20,13 @@ use crate::gekko::condition::ConditionRegister;
 #[allow(dead_code, unused_variables, non_upper_case_globals, clippy::all)]
 pub mod lut {
     include!(concat!(env!("OUT_DIR"), "/gekko_lut.rs"));
+    include!(concat!(env!("OUT_DIR"), "/gekko_resolve.rs"));
 }
 
 #[allow(dead_code, unused_variables, non_upper_case_globals, clippy::all)]
 pub mod lut_wii {
     include!(concat!(env!("OUT_DIR"), "/gekko_lut_wii.rs"));
+    include!(concat!(env!("OUT_DIR"), "/gekko_resolve_wii.rs"));
 }
 
 pub const IPL_RESET_VECTOR: u32 = 0xFFF0_0100;
@@ -169,6 +173,32 @@ impl Gekko {
         } else {
             unsafe { *self.gprs.get_unchecked(index as usize) }
         }
+    }
+}
+
+/// The number of the handler `dispatch` would run for `instr`, for a block that is
+/// decoded once and executed through `execute`.
+#[inline(always)]
+pub fn resolve<const SYSTEM: crate::system::SystemId>(instr: instruction::Instruction) -> u16 {
+    if SYSTEM == crate::system::GC {
+        self::lut::resolve(instr)
+    } else {
+        self::lut_wii::resolve(instr)
+    }
+}
+
+#[inline(always)]
+pub fn execute<const SYSTEM: crate::system::SystemId>(
+    leaf: u16,
+    ctx: &mut crate::system::System<SYSTEM>,
+    instr: instruction::Instruction,
+) {
+    if SYSTEM == crate::system::GC {
+        let ctx: &mut crate::gamecube::GameCube = unsafe { core::mem::transmute(ctx) };
+        self::lut::execute(leaf, ctx, instr);
+    } else {
+        let ctx: &mut crate::wii::Wii = unsafe { core::mem::transmute(ctx) };
+        self::lut_wii::execute(leaf, ctx, instr);
     }
 }
 

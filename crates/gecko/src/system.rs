@@ -50,6 +50,7 @@ pub struct System<const SYSTEM: SystemId> {
     pub vi_present_seen_this_frame: bool,
     pub execution_mode: ExecutionMode,
     pub gekko: Gekko,
+    pub block_cache: Option<Box<crate::gekko::cache::BlockCache<SYSTEM>>>,
     pub scheduler: Scheduler<SYSTEM>,
     pub mmio: Mmio<SYSTEM>,
     pub vi: VideoInterface,
@@ -113,6 +114,7 @@ impl<const SYSTEM: SystemId> System<SYSTEM> {
             vi_present_seen_this_frame: false,
             execution_mode: ExecutionMode::default(),
             gekko: Gekko::new(entrypoint),
+            block_cache: None,
             scheduler,
             mmio: Mmio::new(),
             vi: VideoInterface::new(),
@@ -759,39 +761,40 @@ impl<const SYSTEM: SystemId> System<SYSTEM> {
     #[inline(always)]
     #[cfg_attr(feature = "hotpath", hotpath::measure)]
     fn run_until_deadline_interp(&mut self) {
+        let mut cache = self.block_cache.take().unwrap_or_default();
+
         while self.scheduler.cycles < self.scheduler.next_deadline() {
-            self.step_cpu();
-            if self.gekko.pc <= self.gekko.cia && self.interp_closed_idle_loop() {
+            if self.gekko.msr.external_interrupt_enable() {
+                if self.pi.interrupt_pending() {
+                    self.cause_external_interrupt();
+                    self.scheduler.cycles += 2;
+                    continue;
+                }
+
+                if self.gekko.dec.interrupt_pending() {
+                    self.cause_decrementer_interrupt();
+                    self.scheduler.cycles += 2;
+                    continue;
+                }
+            }
+
+            if cache.run_block(self) {
                 let deadline = self.scheduler.next_deadline();
                 if self.scheduler.cycles < deadline {
                     self.scheduler.cycles = deadline;
                 }
             }
-        }
-    }
 
-    /// Whether the instruction just executed branched back over an idle loop — the
-    /// same loops the JIT classifies, seen one branch at a time: `cia` went back to
-    /// `pc`, and the body between reads only what an interrupt or a DMA could change.
-    fn interp_closed_idle_loop(&self) -> bool {
-        use crate::gekko::idle;
-        let (start, end) = (self.gekko.pc, self.gekko.cia);
-        let body_len = ((end - start) / 4) as usize;
-        if body_len > idle::MAX_IDLE_BODY {
-            return false;
+            if self.mmio.jit_dirty != 0 {
+                let lines: smallvec::SmallVec<[u32; 8]> = self.mmio.pending_icbi.drain().collect();
+                for line in lines {
+                    cache.invalidate_line(&mut self.mmio, line);
+                }
+                self.mmio.jit_dirty = 0;
+            }
         }
-        let terminator = crate::gekko::instruction::Instruction(self.mmio.fetch_instruction(end));
-        if body_len == 0 {
-            return idle::is_branch_to_self(terminator, end);
-        }
-        if !idle::is_idle_loop_terminator(terminator, end, start) {
-            return false;
-        }
-        let mut body = [0u32; idle::MAX_IDLE_BODY];
-        for (i, word) in body[..body_len].iter_mut().enumerate() {
-            *word = self.mmio.fetch_instruction(start + (i as u32) * 4);
-        }
-        idle::validate_idle_loop(&body[..body_len])
+
+        self.block_cache = Some(cache);
     }
 
     /// JIT inner loop: runs compiled blocks back-to-back until

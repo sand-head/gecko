@@ -274,7 +274,6 @@ impl Dsp {
                 let src = &self.aram[aram_addr..aram_addr + count];
                 let dst = mmio.virt_slice_mut(ram_addr as u32, count);
                 dst.copy_from_slice(src);
-                #[cfg(feature = "jit")]
                 mmio.queue_icbi_for_range(crate::mmio::virt_to_phys(ram_addr as u32), count as u32);
             }
             regs::DmaDirection::RamToAram if within_bounds => {
@@ -342,7 +341,6 @@ impl Dsp {
                 let src = &memory[dsp_addr..dsp_addr + len];
                 let dst = mmio.virt_slice_mut(ram_addr, len);
                 dst.copy_from_slice(src);
-                #[cfg(feature = "jit")]
                 mmio.queue_icbi_for_range(crate::mmio::virt_to_phys(ram_addr), len as u32);
             }
         }

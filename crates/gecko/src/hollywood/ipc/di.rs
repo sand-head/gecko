@@ -108,7 +108,6 @@ impl DiskInterface {
 
             let dst = ctx.mmio.phys_slice_mut(out_ptr, length as usize);
             dvd.read_raw_disc(pos_bytes as usize, dst);
-            #[cfg(feature = "jit")]
             ctx.mmio.queue_icbi_for_range(out_ptr, length);
             self.last_error = DI_ERROR_OK;
 
@@ -195,7 +194,6 @@ impl DiskInterface {
 
         let dst = ctx.mmio.phys_slice_mut(out_ptr, size as usize);
         dvd.read_disc_into(pos_bytes as usize, dst);
-        #[cfg(feature = "jit")]
         ctx.mmio.queue_icbi_for_range(out_ptr, size);
         self.last_error = DI_ERROR_OK;
 

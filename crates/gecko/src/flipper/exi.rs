@@ -350,7 +350,6 @@ pub fn run_dma<const CHANNEL: usize, const SYSTEM: SystemId>(sys: &mut System<SY
                 }
 
                 device.dma_read(sys.mmio.phys_slice_mut(address, length as usize));
-                #[cfg(feature = "jit")]
                 sys.mmio.queue_icbi_for_range(address, length);
             }
             TransferType::Write => {

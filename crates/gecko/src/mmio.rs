@@ -34,9 +34,7 @@ pub struct Mmio<const SYSTEM: SystemId> {
     pub fastmem_lut_ptr: usize,
     pub code_refcount: Box<[u8]>,
     pub code_refcount_ptr: usize,
-    #[cfg(feature = "jit")]
     pub pending_icbi: FxHashSet<u32>,
-    #[cfg(feature = "jit")]
     pub jit_dirty: u8,
 }
 
@@ -158,9 +156,7 @@ impl<const SYSTEM: SystemId> Mmio<SYSTEM> {
             fastmem_lut_ptr,
             code_refcount,
             code_refcount_ptr,
-            #[cfg(feature = "jit")]
             pending_icbi: FxHashSet::default(),
-            #[cfg(feature = "jit")]
             jit_dirty: 0,
         }
     }
@@ -376,7 +372,6 @@ impl<const SYSTEM: SystemId> Mmio<SYSTEM> {
         self.code_refcount.fill(0);
     }
 
-    #[cfg(feature = "jit")]
     #[inline(always)]
     pub fn queue_icbi_for_range(&mut self, phys: u32, len: u32) {
         Self::for_each_code_line(phys, len, |line| {

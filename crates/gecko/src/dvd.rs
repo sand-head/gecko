@@ -147,7 +147,6 @@ fn process_dvd_command<const SYSTEM: SystemId>(sys: &mut System<SYSTEM>, cmd: Co
             let dst = sys.di.dma_address.address();
             let buffer = sys.mmio.phys_slice_mut(dst, 0x20);
             buffer.copy_from_slice(&[0x69; 0x20]); // TODO: Drive Info?
-            #[cfg(feature = "jit")]
             sys.mmio.queue_icbi_for_range(dst, 0x20);
         }
         Command::ReadSectorData => {
@@ -158,7 +157,6 @@ fn process_dvd_command<const SYSTEM: SystemId>(sys: &mut System<SYSTEM>, cmd: Co
 
             let buffer = sys.mmio.phys_slice_mut(dst, len);
             dvd.read_disc_into(src as usize, buffer);
-            #[cfg(feature = "jit")]
             sys.mmio.queue_icbi_for_range(dst, len as u32);
 
             tracing::debug!(
@@ -175,7 +173,6 @@ fn process_dvd_command<const SYSTEM: SystemId>(sys: &mut System<SYSTEM>, cmd: Co
 
             let buffer = sys.mmio.phys_slice_mut(dst, len);
             dvd.read_disc_into(0, buffer);
-            #[cfg(feature = "jit")]
             sys.mmio.queue_icbi_for_range(dst, len as u32);
 
             tracing::debug!(
