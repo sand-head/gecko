@@ -92,7 +92,8 @@ impl<const SYSTEM: SystemId> MmioAccess<System<SYSTEM>> for ControlStatus {
             .with_ai_interrupt_mask(self.ai_interrupt_mask())
             .with_ar_interrupt_mask(self.ar_interrupt_mask())
             .with_dsp_interrupt_mask(self.dsp_interrupt_mask())
-            .with_dma_status(self.dma_status())
+            // DSPDMA is status the hardware owns: a CPU that reads the register and
+            // writes it back while a DMA is running must not pin the bit high.
             .with_reset_vector(self.reset_vector());
 
         // On reset, set PC to the address indicated by the reset vector. After

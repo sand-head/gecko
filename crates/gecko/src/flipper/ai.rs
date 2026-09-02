@@ -75,8 +75,6 @@ pub fn start_audio_dma<const SYSTEM: SystemId>(sys: &mut System<SYSTEM>) {
     sys.scheduler.cancel(self::audio_dma_block_handler);
     sys.ai.audio_dma_remaining_blocks = blocks;
     sys.ai.audio_dma_current_addr = sys.dsp.audio_dma_start_addr.raw();
-    sys.dsp.csr.set_dma_status(true);
-
     let addr = sys.dsp.audio_dma_start_addr.raw();
     let len = blocks as u32 * AUDIO_DMA_BLOCK_BYTES;
 
@@ -90,7 +88,6 @@ pub fn start_audio_dma<const SYSTEM: SystemId>(sys: &mut System<SYSTEM>) {
 pub fn stop_audio_dma<const SYSTEM: SystemId>(sys: &mut System<SYSTEM>) {
     sys.scheduler.cancel(self::audio_dma_block_handler);
     sys.ai.audio_dma_remaining_blocks = 0;
-    sys.dsp.csr.set_dma_status(false);
 }
 
 #[inline(always)]
@@ -140,7 +137,6 @@ pub fn audio_dma_block_handler<const SYSTEM: SystemId>(sys: &mut System<SYSTEM>)
     }
 
     if sys.dsp.audio_dma_control.play() {
-        sys.dsp.csr.set_dma_status(true);
         sys.scheduler
             .schedule_in(cycles_per_audio_dma_block(sys), self::audio_dma_block_handler);
     } else {
