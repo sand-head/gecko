@@ -88,6 +88,14 @@ impl ExternalInterface {
             .and_then(|any| any.downcast_mut::<macronix::ExiMacronix>())
     }
 
+    /// The memory card in a slot (channel 0 is slot A), if one was inserted.
+    pub fn memory_card_mut(&mut self, channel: usize) -> Option<&mut memcard::ExiMemoryCard> {
+        self.devices[channel][0]
+            .as_mut()
+            .and_then(|d| d.as_any_mut())
+            .and_then(|any| any.downcast_mut::<memcard::ExiMemoryCard>())
+    }
+
     #[inline(always)]
     pub fn interrupt_active(&self) -> bool {
         Self::channel_interrupt_active(&self.ch0_csr)

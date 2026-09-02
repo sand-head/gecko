@@ -82,6 +82,16 @@ impl ExiMemoryCard {
         }
     }
 
+    /// The card's whole flash, for a host that keeps saves somewhere other than a
+    /// file — a browser, say.
+    pub fn data(&self) -> &[u8] {
+        &self.data
+    }
+
+    pub fn data_mut(&mut self) -> &mut [u8] {
+        &mut self.data
+    }
+
     fn flush(&self) {
         if let Some(path) = &self.path {
             super::device::persist_backing(path, &self.data, "memory card");
@@ -104,6 +114,10 @@ impl ExiMemoryCard {
 }
 
 impl super::device::ExiDevice for ExiMemoryCard {
+    fn as_any_mut(&mut self) -> Option<&mut dyn std::any::Any> {
+        Some(self)
+    }
+
     fn on_select(&mut self) {
         self.position = 0;
     }
