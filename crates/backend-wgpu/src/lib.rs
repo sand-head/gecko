@@ -315,6 +315,16 @@ pub struct GxRenderer {
     /// queue is allocated and zeroed at its full capacity every time, which on the web
     /// backend is several megabytes of memset and copy for a handful of draws.
     pub(crate) packed_vertex_bytes: Vec<u8>,
+    /// The draw before this one, and the state it was drawn under. A game submits a
+    /// scene as thousands of little draws of which nearly every one asks for exactly what
+    /// the one before it asked for, differing only in which vertices to use; recognising
+    /// that costs one comparison and saves building the pipeline key, the bind group key
+    /// and both uniform blocks all over again.
+    pub(crate) last_draw: Option<Box<gecko::host::DrawData>>,
+    /// Bumped by every action that is not a draw, so a draw only trusts the comparison
+    /// when nothing has been able to change what a draw is drawn with.
+    pub(crate) state_epoch: u64,
+    pub(crate) last_draw_epoch: u64,
     pub(crate) bind_group_cache: FxHashMap<BindGroupCacheKey, wgpu::BindGroup>,
     // Per-frame draw accumulation (persists across process_action calls,
     // flushed by flush_pending_draws).
@@ -973,6 +983,9 @@ impl GxRenderer {
             scratch_draws: Vec::new(),
             scratch_uniform_bytes: Vec::new(),
             packed_vertex_bytes: Vec::new(),
+            last_draw: None,
+            state_epoch: 1,
+            last_draw_epoch: 0,
             bind_group_cache: FxHashMap::default(),
             frame_uniform_bytes: Vec::new(),
             draw_pipeline_keys: Vec::new(),

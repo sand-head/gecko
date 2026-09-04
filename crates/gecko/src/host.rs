@@ -170,7 +170,7 @@ pub struct XfbPart {
 /// scratch buffer (see [`RenderSink::vertex_scratch`]); `base_vertex` is
 /// the index into that buffer where this draw's vertices start and
 /// `vertex_count` is how many of them belong to this draw.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct DrawData {
     pub primitive: Primitive,
     pub base_vertex: u32,

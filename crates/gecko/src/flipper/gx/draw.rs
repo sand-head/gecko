@@ -1,7 +1,7 @@
 use super::regs::*;
 use chapa::BitEnum;
 
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum Primitive {
     Quads,
     #[default]

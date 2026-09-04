@@ -132,6 +132,11 @@ impl GxRenderer {
     /// backend-wgpu sink. Draws are accumulated and flushed lazily when a
     /// non-draw action arrives.
     pub fn process_action(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, action: &GxAction) {
+        // Anything that is not a draw may change what the next draw is drawn with, so the
+        // draw after it has to work everything out again.
+        if !matches!(action, GxAction::Draw(_)) {
+            self.state_epoch = self.state_epoch.wrapping_add(1);
+        }
         let draw_stride = self.draw_uniform_stride as usize;
         let draw_struct_size = DRAW_UNIFORMS_SIZE.get() as usize;
         let frame_stride = self.frame_stride;
@@ -279,6 +284,31 @@ impl GxRenderer {
             GxAction::Draw(draw) => {
                 if cull_all_suppresses_draw(self.current_cull_mode, draw.primitive) {
                     self.last_frame_uniform_index = None;
+                    return;
+                }
+
+                // The same draw as last time, under a state nothing has touched since,
+                // differing only in which vertices it uses: everything the slow path
+                // would derive is what it derived before, so all that is left is the
+                // merge it would have arrived at.
+                let repeats = self.repeats_the_last_draw(draw) && self.last_draw_epoch == self.state_epoch;
+                self.last_draw_epoch = self.state_epoch;
+                if repeats
+                    && self.last_frame_uniform_index.is_some()
+                    && draw_emits_triangles(draw)
+                    && let Some(previous) = self.scratch_draws.len().checked_sub(1)
+                    && self.scratch_draws[previous].src_vertex_index + self.scratch_draws[previous].vertex_count
+                        == draw.base_vertex
+                {
+                    let vertex_bias = self.scratch_draws[previous].vertex_count;
+                    let (_, more) = emit_draw_indices(draw, &mut self.scratch_indices, vertex_bias);
+                    let merged = &mut self.scratch_draws[previous];
+                    merged.vertex_count += draw.vertex_count;
+                    merged.index_count += more;
+                    #[cfg(feature = "renderdoc-capture")]
+                    {
+                        self.draw_primitives[previous] = Primitive::Triangles;
+                    }
                     return;
                 }
 
@@ -607,6 +637,47 @@ impl GxRenderer {
                 }
             }
         }
+    }
+
+    /// Whether this draw asks for exactly what the last one asked for, apart from which
+    /// vertices it uses. Remembers this draw either way, so the next one can ask.
+    ///
+    /// Only the whole numbers are compared, and that is enough. Every floating-point
+    /// field a draw carries — the TEV colours, the constants, the ambient and material
+    /// colours, the lights — is read in exactly one place, building the frame uniforms,
+    /// and only for a draw that says its frame state changed; a draw that does not say so
+    /// reuses the block the last one built, so what those fields hold cannot reach
+    /// anything. The modelview is not read here at all: vertices arrive transformed.
+    /// A draw whose frame state *did* change goes the long way round.
+    fn repeats_the_last_draw(&mut self, draw: &DrawData) -> bool {
+        let same = !draw.frame_dirty
+            && self.last_draw.as_deref().is_some_and(|last| {
+                // Only the stages in use are read, by the shader key, the key it is
+                // specialised with and the slot mask alike, so only those are compared.
+                let stages = usize::from(draw.num_tev_stages.clamp(1, 16));
+                !last.frame_dirty
+                    && last.primitive == draw.primitive
+                    && last.active_texcoords == draw.active_texcoords
+                    && last.num_tev_stages == draw.num_tev_stages
+                    && last.num_indirect_stages == draw.num_indirect_stages
+                    && last.tev_ksel == draw.tev_ksel
+                    && last.indirect_refs == draw.indirect_refs
+                    && last.color_ctrl == draw.color_ctrl
+                    && last.alpha_ctrl == draw.alpha_ctrl
+                    && last.ztex_type == draw.ztex_type
+                    && last.ztex_op == draw.ztex_op
+                    && last.tev_color_env[..stages] == draw.tev_color_env[..stages]
+                    && last.tev_alpha_env[..stages] == draw.tev_alpha_env[..stages]
+                    && last.tev_orders[..stages] == draw.tev_orders[..stages]
+                    && last.tev_indirect[..stages] == draw.tev_indirect[..stages]
+            });
+        if !same {
+            match self.last_draw.as_deref_mut() {
+                Some(last) => last.clone_from(draw),
+                None => self.last_draw = Some(Box::new(draw.clone())),
+            }
+        }
+        same
     }
 
     /// Flush accumulated draw calls into a render pass.
