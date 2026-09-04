@@ -12,11 +12,13 @@ pub mod regs;
 #[allow(dead_code, unused_variables, non_upper_case_globals, clippy::all)]
 pub mod lut {
     include!(concat!(env!("OUT_DIR"), "/dsp_lut.rs"));
+    include!(concat!(env!("OUT_DIR"), "/dsp_resolve.rs"));
 }
 
 #[allow(dead_code, unused_variables, non_upper_case_globals, clippy::all)]
 pub mod lut_wii {
     include!(concat!(env!("OUT_DIR"), "/dsp_lut_wii.rs"));
+    include!(concat!(env!("OUT_DIR"), "/dsp_resolve_wii.rs"));
 }
 
 use crate::flipper::dsp::instruction::Instruction;
@@ -26,8 +28,30 @@ use crate::system::{ExecutionMode, System, SystemId};
 #[cfg(feature = "jit")]
 pub const DSP_JIT_CHAIN_BUDGET: u32 = 64;
 
+/// One instruction as the interpreter needs it, worked out once. Reaching an instruction
+/// used to cost two reads of instruction memory, a word built out of their bytes, one
+/// walk of the decode tree to find how long it is and another to find its handler, ending
+/// in a call through a table — which in WebAssembly is a checked indirect call. All of
+/// that is the same every time the instruction runs, so it is done once and kept here,
+/// and running it is a load and a jump.
+///
+/// `size` is zero for an entry nothing has filled in yet; a real one is one word or two.
+#[derive(Clone, Copy, Default, Debug)]
+pub struct Decoded {
+    pub instr: u32,
+    pub leaf: u16,
+    pub size: u8,
+}
+
+/// Instruction memory is 0x1000 words of IRAM and 0x1000 of IROM, and the cache holds
+/// one entry for each.
+const DECODED_SLOTS: usize = 0x2000;
+
 pub struct Dsp {
     pub registers: core::Registers,
+    /// Instructions already worked out, by where they are. Emptied whenever instruction
+    /// memory changes, which is the only thing that can make an entry wrong.
+    pub decoded: Box<[Decoded; DECODED_SLOTS]>,
 
     pub iram: Box<[u8; 0x2000]>,
     pub irom: Box<[u8; 0x2000]>,
@@ -85,6 +109,10 @@ impl Dsp {
 
         Dsp {
             registers: core::Registers::default(),
+            decoded: vec![Decoded::default(); DECODED_SLOTS]
+                .into_boxed_slice()
+                .try_into()
+                .expect("the decode cache is exactly its own size"),
             iram,
             irom,
             dram,
@@ -158,7 +186,20 @@ impl Dsp {
         }
     }
 
+    /// Where in the decode cache an instruction address lives, if it is somewhere the
+    /// cache covers.
+    #[inline(always)]
+    fn decoded_slot(addr: u16) -> Option<usize> {
+        match addr {
+            0x0000..0x1000 => Some(addr as usize),
+            0x8000..0x9000 => Some(0x1000 + (addr - 0x8000) as usize),
+            _ => None,
+        }
+    }
+
     pub fn rebuild_wait_table(&mut self) {
+        // Instruction memory has changed, so everything worked out from it is wrong.
+        self.decoded.fill(Decoded::default());
         const SDK_OFFSETS: [i16; 3] = [0, -1, -3];
         const IPL_OFFSETS: [i16; 5] = [0, -1, -2, -3, -5];
         const ZELDA_MAIL_OFFSETS: [i16; 3] = [0, -2, -4];
@@ -377,21 +418,18 @@ impl<const SYSTEM: SystemId> System<SYSTEM> {
             self.dsp.registers.pc = 0x000E;
         }
 
-        let pc = self.dsp.registers.pc as usize;
-        let w0 = self.dsp.read_imem(pc as u16);
-        let w1 = self.dsp.read_imem((pc as u16).wrapping_add(1));
-        let buf = [(w0 >> 8) as u8, w0 as u8, (w1 >> 8) as u8, w1 as u8];
-        let instr = Instruction::from_be_bytes(&buf);
-        self.dsp.registers.cia = self.dsp.registers.pc;
-        let natural_nia = self.dsp.registers.cia.wrapping_add(lut::instr_size(instr) as u16);
-        self.dsp.registers.nia = natural_nia;
+        let pc = self.dsp.registers.pc;
+        let Decoded { instr, leaf, size } = self.dsp.decode::<SYSTEM>(pc);
+        let instr = Instruction(instr);
+        self.dsp.registers.cia = pc;
+        self.dsp.registers.nia = pc.wrapping_add(size as u16);
 
         let ext_op = instr.ext_opcode();
         if ext_op.is_some() {
             self.dsp.registers.cache_ext_ac();
         }
 
-        self::dispatch(self, instr);
+        self::execute(self, leaf, instr);
 
         if let Some(ext) = ext_op {
             self::dispatch_gc_dsp_ext(self, instruction::GcDspExt(ext));
@@ -643,7 +681,34 @@ crate::mmio_device_dispatch! {
 }
 
 impl Dsp {
+    /// The instruction at `addr`, worked out the first time and remembered after.
     #[inline(always)]
+    pub fn decode<const SYSTEM: SystemId>(&mut self, addr: u16) -> Decoded {
+        let slot = Self::decoded_slot(addr);
+        if let Some(slot) = slot {
+            let entry = self.decoded[slot];
+            if entry.size != 0 {
+                return entry;
+            }
+        }
+        let w0 = self.read_imem(addr);
+        let w1 = self.read_imem(addr.wrapping_add(1));
+        let instr = Instruction::from_be_bytes(&[(w0 >> 8) as u8, w0 as u8, (w1 >> 8) as u8, w1 as u8]);
+        let entry = Decoded {
+            instr: instr.0,
+            leaf: self::resolve::<SYSTEM>(instr),
+            size: if SYSTEM == crate::system::GC {
+                lut::instr_size(instr) as u8
+            } else {
+                lut_wii::instr_size(instr) as u8
+            },
+        };
+        if let Some(slot) = slot {
+            self.decoded[slot] = entry;
+        }
+        entry
+    }
+
     pub fn read_imem(&self, addr: u16) -> u16 {
         match addr {
             0x0000..0x1000 => read_word(&*self.iram, addr),
@@ -898,6 +963,28 @@ pub fn dispatch<const SYSTEM: SystemId>(ctx: &mut System<SYSTEM>, instr: Instruc
     }
 }
 
+/// The number `dispatch` would have walked its tables to reach, so an instruction the
+/// decode cache has already seen goes straight to its handler through one jump.
+#[inline(always)]
+pub fn resolve<const SYSTEM: SystemId>(instr: Instruction) -> u16 {
+    if SYSTEM == crate::system::GC {
+        self::lut::resolve(instr)
+    } else {
+        self::lut_wii::resolve(instr)
+    }
+}
+
+#[inline(always)]
+pub fn execute<const SYSTEM: SystemId>(ctx: &mut System<SYSTEM>, leaf: u16, instr: Instruction) {
+    if SYSTEM == crate::system::GC {
+        let ctx: &mut crate::gamecube::GameCube = unsafe { ::core::mem::transmute(ctx) };
+        self::lut::execute(leaf, ctx, instr);
+    } else {
+        let ctx: &mut crate::wii::Wii = unsafe { ::core::mem::transmute(ctx) };
+        self::lut_wii::execute(leaf, ctx, instr);
+    }
+}
+
 #[inline(always)]
 pub fn dispatch_gc_dsp_ext<const SYSTEM: SystemId>(ctx: &mut System<SYSTEM>, instr: instruction::GcDspExt) {
     if SYSTEM == crate::system::GC {
@@ -983,5 +1070,115 @@ impl<const SYSTEM: SystemId> DspJitHandle for jit::JitEngine<SYSTEM> {
         }
         #[cfg(not(feature = "jit-stats"))]
         tracing::warn!("feature `jit-stats` is not enabled. Rebuild with `--features jit-stats`.");
+    }
+}
+
+/// The decode cache sends an instruction to a handler by number, where `dispatch` walked
+/// a tree of tables to reach it. They have to be the same handler, for every instruction
+/// there is: the number comes from a table generated beside the one the tree walks, and
+/// nothing else checks that the two stayed in step.
+#[cfg(test)]
+mod decode_tests {
+    use super::*;
+    use crate::system::GC;
+
+    /// Everything a handler could have touched, cheaply.
+    fn fingerprint(dsp: &Dsp) -> Vec<u16> {
+        let r = &dsp.registers;
+        let mut out = vec![
+            r.pc,
+            r.nia,
+            r.cia,
+            r.ac0_high,
+            r.ac1_high,
+            r.ac0_mid,
+            r.ac1_mid,
+            r.ac0_low,
+            r.ac1_low,
+            r.config,
+            r.status.raw(),
+            r.product_low,
+            r.product_mid1,
+            r.product_high,
+            r.product_mid2,
+        ];
+        out.extend(r.ar);
+        out.extend(r.ix);
+        out.extend(r.wr);
+        out.extend(r.ax);
+        out.extend(r.axh);
+        let sum = |bytes: &[u8]| {
+            bytes
+                .iter()
+                .fold(0u16, |a, &b| a.wrapping_mul(31).wrapping_add(b as u16))
+        };
+        out.push(sum(&dsp.dram[..]));
+        out.push(sum(&dsp.ifx[..]));
+        out
+    }
+
+    /// The same starting point for both runs, with something in every register so a
+    /// handler that only moves one has something to move.
+    fn seed(dsp: &mut Dsp) {
+        dsp.registers = core::Registers::default();
+        dsp.registers.pc = 0x0100;
+        for i in 0..4 {
+            dsp.registers.ar[i] = 0x0010 + i as u16;
+            dsp.registers.ix[i] = 1;
+            dsp.registers.wr[i] = 0xFFFF;
+        }
+        dsp.registers.ac0_high = 0x1234;
+        dsp.registers.ac1_high = 0x5678;
+        dsp.registers.ac0_mid = 0x9ABC;
+        dsp.registers.ac1_mid = 0xDEF0;
+        dsp.registers.ax[0] = 0x0F0F;
+        dsp.registers.ax[1] = 0xF0F0;
+        dsp.registers.axh[0] = 0x00FF;
+        dsp.registers.axh[1] = 0xFF00;
+        for (i, byte) in dsp.dram.iter_mut().enumerate() {
+            *byte = i as u8;
+        }
+        dsp.ifx.fill(0);
+    }
+
+    #[test]
+    fn every_opcode_reaches_the_handler_dispatch_would() {
+        let mut sys = crate::gamecube::GameCube::new(0x8000_3000);
+        // An unimplemented opcode panics, in both paths alike; the sweep visits plenty.
+        let hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+
+        let mut checked = 0u32;
+        let mut differ = Vec::new();
+        for top in 0..=0xFFFFu32 {
+            let instr = Instruction((top << 16) | 0x00FF);
+
+            seed(&mut sys.dsp);
+            let walked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                self::dispatch::<GC>(&mut sys, instr);
+                fingerprint(&sys.dsp)
+            }));
+
+            seed(&mut sys.dsp);
+            let numbered = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let leaf = self::resolve::<GC>(instr);
+                self::execute::<GC>(&mut sys, leaf, instr);
+                fingerprint(&sys.dsp)
+            }));
+
+            match (walked, numbered) {
+                (Ok(a), Ok(b)) if a == b => checked += 1,
+                (Err(_), Err(_)) => {}
+                _ if differ.len() < 8 => differ.push(top),
+                _ => {}
+            }
+        }
+        std::panic::set_hook(hook);
+
+        assert!(differ.is_empty(), "opcodes reaching a different handler: {differ:04x?}");
+        assert!(
+            checked > 40_000,
+            "only {checked} opcodes ran at all; the sweep proves little"
+        );
     }
 }

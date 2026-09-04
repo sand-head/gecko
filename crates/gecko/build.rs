@@ -10,16 +10,21 @@ fn main() {
     chipi_build::generate_bindings("spec/wii_gekko_jit.bindings.chipi").expect("chipi codegen failed (wii gekko jit)");
     chipi_build::generate_bindings("spec/dsp_jit.bindings.chipi").expect("chipi codegen failed (dsp jit)");
 
-    // The interpreter's dispatch tree, walked once per instruction by the block cache
-    // instead of once per execution. chipi does not know about it, so it is generated
-    // from the tables chipi wrote.
+    // The interpreters' dispatch trees, walked once per instruction by the caches that
+    // remember what they found instead of once per execution — the Gekko's block cache
+    // and the DSP's decode cache. chipi does not know about either, so they are
+    // generated from the tables chipi wrote.
     let out = PathBuf::from(env::var("OUT_DIR").unwrap());
-    for (lut, resolve) in [
-        ("gekko_lut.rs", "gekko_resolve.rs"),
-        ("gekko_lut_wii.rs", "gekko_resolve_wii.rs"),
+    const GEKKO: &str = "crate::gekko::instruction::Instruction";
+    const DSP: &str = "crate::flipper::dsp::instruction::Instruction";
+    for (lut, resolve, instruction) in [
+        ("gekko_lut.rs", "gekko_resolve.rs", GEKKO),
+        ("gekko_lut_wii.rs", "gekko_resolve_wii.rs", GEKKO),
+        ("dsp_lut.rs", "dsp_resolve.rs", DSP),
+        ("dsp_lut_wii.rs", "dsp_resolve_wii.rs", DSP),
     ] {
         let source = fs::read_to_string(out.join(lut)).expect(lut);
-        fs::write(out.join(resolve), resolvers_for(&source)).expect(resolve);
+        fs::write(out.join(resolve), resolvers_for(&source, instruction)).expect(resolve);
     }
 }
 
@@ -28,9 +33,8 @@ fn main() {
 /// through one `match`, so a block decoded once dispatches with a jump rather than a
 /// call through a table. Every `_dN` decoder gets an `_rN` resolver over a parallel
 /// `_RN` table whose leaves are the numbers.
-fn resolvers_for(lut: &str) -> String {
-    const INSTRUCTION: &str = "crate::gekko::instruction::Instruction";
-    let mut out = format!("pub type Resolver = fn({INSTRUCTION}) -> u16;\n\n");
+fn resolvers_for(lut: &str, instruction: &str) -> String {
+    let mut out = format!("pub type Resolver = fn({instruction}) -> u16;\n\n");
     let mut leaves: Vec<String> = Vec::new();
     let mut lines = lut.lines();
     while let Some(line) = lines.next() {
@@ -64,16 +68,16 @@ fn resolvers_for(lut: &str) -> String {
             let index = rest.rsplit_once("](ctx, instr)").unwrap().0;
             let table = table.trim_start_matches("_T");
             out.push_str(&format!(
-                "fn _r{decoder}(instr: {INSTRUCTION}) -> u16 {{\n    _R{table}[{index}](instr)\n}}\n\n"
+                "fn _r{decoder}(instr: {instruction}) -> u16 {{\n    _R{table}[{index}](instr)\n}}\n\n"
             ));
             lines.next();
         }
     }
     for i in 0..leaves.len() {
-        out.push_str(&format!("fn _leaf{i}(_: {INSTRUCTION}) -> u16 {{\n    {i}\n}}\n\n"));
+        out.push_str(&format!("fn _leaf{i}(_: {instruction}) -> u16 {{\n    {i}\n}}\n\n"));
     }
     out.push_str(&format!(
-        "/// The number of the handler `dispatch` would call for this instruction word.\n#[inline(always)]\npub fn resolve(instr: {INSTRUCTION}) -> u16 {{\n    _r0(instr)\n}}\n\n"
+        "/// The number of the handler `dispatch` would call for this instruction word.\n#[inline(always)]\npub fn resolve(instr: {instruction}) -> u16 {{\n    _r0(instr)\n}}\n\n"
     ));
     let ctx = lut
         .lines()
@@ -81,7 +85,7 @@ fn resolvers_for(lut: &str) -> String {
         .and_then(|l| l.split(',').next())
         .expect("Handler type");
     out.push_str(&format!(
-        "/// Runs handler number `leaf`, as `resolve` numbered it.\n#[inline(always)]\npub fn execute(leaf: u16, ctx: &mut {ctx}, instr: {INSTRUCTION}) {{\n    match leaf {{\n"
+        "/// Runs handler number `leaf`, as `resolve` numbered it.\n#[inline(always)]\npub fn execute(leaf: u16, ctx: &mut {ctx}, instr: {instruction}) {{\n    match leaf {{\n"
     ));
     for (i, leaf) in leaves.iter().enumerate() {
         out.push_str(&format!("        {i} => {leaf}(ctx, instr),\n"));
