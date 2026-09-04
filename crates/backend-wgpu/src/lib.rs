@@ -310,6 +310,11 @@ pub struct GxRenderer {
     pub(crate) scratch_vertices: Vec<GpuVertex>,
     pub(crate) scratch_draws: Vec<DrawRecord>,
     pub(crate) scratch_uniform_bytes: Vec<u8>,
+    /// The vertices of one flush, packed into the strides their draws use, ready to go
+    /// to the GPU in one write. Kept between flushes: a staging buffer asked of the
+    /// queue is allocated and zeroed at its full capacity every time, which on the web
+    /// backend is several megabytes of memset and copy for a handful of draws.
+    pub(crate) packed_vertex_bytes: Vec<u8>,
     pub(crate) bind_group_cache: FxHashMap<BindGroupCacheKey, wgpu::BindGroup>,
     // Per-frame draw accumulation (persists across process_action calls,
     // flushed by flush_pending_draws).
@@ -967,6 +972,7 @@ impl GxRenderer {
             scratch_vertices: Vec::new(),
             scratch_draws: Vec::new(),
             scratch_uniform_bytes: Vec::new(),
+            packed_vertex_bytes: Vec::new(),
             bind_group_cache: FxHashMap::default(),
             frame_uniform_bytes: Vec::new(),
             draw_pipeline_keys: Vec::new(),

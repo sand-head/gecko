@@ -1,4 +1,4 @@
-use crate::{align_up, compute_draw_buffer_layout, GxRenderer, PendingWriteback};
+use crate::{GxRenderer, PendingWriteback, align_up, compute_draw_buffer_layout};
 use gecko::common::Address;
 use gecko::flipper::gx::texture::{self, CopyFormat};
 use gecko::host::XfbPart;
@@ -126,45 +126,44 @@ impl GxRenderer {
             self.bind_group_cache.clear();
         }
 
+        // One write per section, of the bytes this flush actually filled. Asking the
+        // queue for a staging view of the whole buffer instead allocates and zeroes its
+        // entire capacity every flush and copies all of it across — megabytes of work
+        // for a few draws, and the largest single cost in a browser's frame.
         let layout = self.draw_buffer_layout;
-        let total_used = layout.index_offset + index_used;
-        let Some(size) = std::num::NonZeroU64::new(total_used) else {
-            return;
-        };
-        let mut view = queue
-            .write_buffer_with(&self.draw_buffer, 0, size)
-            .expect("gx_draw_buffer too small for write_buffer_with");
-        let frame_off = layout.frame_offset as usize;
-        let draw_off = layout.draw_offset as usize;
-        let vertex_off = layout.vertex_offset as usize;
-        let index_off = layout.index_offset as usize;
-        view.slice(frame_off..frame_off + frame_uniform_bytes.len())
-            .copy_from_slice(frame_uniform_bytes);
-        view.slice(draw_off..draw_off + self.scratch_uniform_bytes.len())
-            .copy_from_slice(&self.scratch_uniform_bytes);
-
-        for draw in &self.scratch_draws {
-            let stride = draw.packed_vertex_stride as usize;
-            let texcoord_bytes = stride - 68;
-            let mut cursor = vertex_off + draw.packed_vertex_byte_offset as usize;
-            let src_base = draw.src_vertex_index as usize;
-            let src_end = src_base + draw.vertex_count as usize;
-            for src_v in &self.scratch_vertices[src_base..src_end] {
-                let src_bytes = bytemuck::bytes_of(src_v);
-
-                view.slice(cursor..cursor + 68).copy_from_slice(&src_bytes[..68]);
-                if texcoord_bytes > 0 {
-                    view.slice(cursor + 68..cursor + 68 + texcoord_bytes)
-                        .copy_from_slice(&src_bytes[68..68 + texcoord_bytes]);
-                }
-
-                cursor += stride;
-            }
+        if frame_used > 0 {
+            queue.write_buffer(&self.draw_buffer, layout.frame_offset, frame_uniform_bytes);
         }
-
-        if !self.scratch_indices.is_empty() {
-            view.slice(index_off..index_off + index_used as usize)
-                .copy_from_slice(bytemuck::cast_slice(&self.scratch_indices));
+        if draw_used > 0 {
+            queue.write_buffer(&self.draw_buffer, layout.draw_offset, &self.scratch_uniform_bytes);
+        }
+        if vertex_used > 0 {
+            let mut packed = std::mem::take(&mut self.packed_vertex_bytes);
+            // A write is measured in whole words; a stride that is not one would
+            // otherwise be refused outright.
+            let vertex_used = (vertex_used as usize).next_multiple_of(4);
+            if packed.len() < vertex_used {
+                packed.resize(vertex_used, 0);
+            }
+            for draw in &self.scratch_draws {
+                let stride = draw.packed_vertex_stride as usize;
+                let mut cursor = draw.packed_vertex_byte_offset as usize;
+                let src_base = draw.src_vertex_index as usize;
+                let src_end = src_base + draw.vertex_count as usize;
+                for src_v in &self.scratch_vertices[src_base..src_end] {
+                    packed[cursor..cursor + stride].copy_from_slice(&bytemuck::bytes_of(src_v)[..stride]);
+                    cursor += stride;
+                }
+            }
+            queue.write_buffer(&self.draw_buffer, layout.vertex_offset, &packed[..vertex_used]);
+            self.packed_vertex_bytes = packed;
+        }
+        if index_used > 0 {
+            queue.write_buffer(
+                &self.draw_buffer,
+                layout.index_offset,
+                bytemuck::cast_slice(&self.scratch_indices),
+            );
         }
     }
 
