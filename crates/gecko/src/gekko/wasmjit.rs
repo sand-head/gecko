@@ -75,6 +75,8 @@ const Q: u32 = 9;
 const S: u32 = 10;
 
 const MSR_FP: i32 = 1 << (31 - 18);
+const RAM_FOLD: i32 = 0x8000_0000u32 as i32;
+const RAM_KEEP: i32 = 0xBFFF_FFFFu32 as i32;
 const MSR_FE: i32 = (1 << (31 - 20)) | (1 << (31 - 23));
 const FPSCR_FEX: i32 = 1 << (31 - 1);
 const XER_SO_SHIFT: i32 = 31;
@@ -422,11 +424,7 @@ fn at(base: u64, align: u32) -> MemArg {
 fn rlw_mask(mb: u32, me: u32) -> u32 {
     let begin = 0xFFFF_FFFFu32 >> mb;
     let end = if me >= 31 { 0 } else { 0xFFFF_FFFFu32 >> (me + 1) };
-    if mb <= me {
-        begin & !end
-    } else {
-        begin | !end
-    }
+    if mb <= me { begin & !end } else { begin | !end }
 }
 
 struct Translator<'a, const SYSTEM: SystemId> {
@@ -628,7 +626,7 @@ impl<const SYSTEM: SystemId> Translator<'_, SYSTEM> {
 
     fn step(&mut self, leaf: u16, instr: Instruction, at: u32, expected: u32, last: bool) {
         let op = crate::gekko::op_of::<SYSTEM>(leaf);
-        if last && self.mask & 16384 != 0 && self.terminator(op, instr, at, expected) {
+        if self.mask & 16384 != 0 && (last || op == OP_BCX) && self.terminator(op, instr, at, expected, last) {
             return;
         }
         if self.integer(op, instr) || self.memory(op, instr) || self.floating(op, leaf, instr, at, expected, last) {
@@ -962,7 +960,7 @@ impl<const SYSTEM: SystemId> Translator<'_, SYSTEM> {
 
     /// The last instruction of a block, when it is a branch: where control goes is the
     /// block's answer, so it is computed rather than written to `nia` and read back.
-    fn terminator(&mut self, op: u32, instr: Instruction, at: u32, expected: u32) -> bool {
+    fn terminator(&mut self, op: u32, instr: Instruction, at: u32, expected: u32, last: bool) -> bool {
         if op == OP_BX {
             self.pending += cycles_for_op(OP_BX);
             let target = if instr.aa() {
@@ -1051,7 +1049,9 @@ impl<const SYSTEM: SystemId> Translator<'_, SYSTEM> {
         self.write_back(true);
         self.flush_cycles_keeping();
         self.code.local_get(A).return_().end();
-        self.exit_const(expected);
+        if last {
+            self.exit_const(expected);
+        }
         true
     }
 
@@ -1533,19 +1533,13 @@ impl<const SYSTEM: SystemId> Translator<'_, SYSTEM> {
     fn in_ram(&mut self, width: Width) {
         self.code
             .local_get(A)
-            .i32_const(0x3FFF_FFFF)
+            .i32_const(RAM_FOLD)
+            .i32_xor()
+            .i32_const(RAM_KEEP)
             .i32_and()
             .local_tee(P)
             .i32_const((RAM_END - (width.bytes() - 1)) as i32)
-            .i32_le_u()
-            .local_get(A)
-            .i32_const(28)
-            .i32_shr_u()
-            .i32_const(4)
-            .i32_or()
-            .i32_const(12)
-            .i32_eq()
-            .i32_and();
+            .i32_le_u();
     }
 
     /// ...and a store also needs the line not to hold code the cache is running.
@@ -2559,6 +2553,45 @@ mod tests {
         validate(&[0x4400_0002, 0x4C00_0064]);
     }
 
+    /// The guard a load and a store are wrapped in used to ask two questions: that the
+    /// address is one of the two segments RAM answers on, and that its offset is inside
+    /// RAM. One fold answers both, and this says so for every address whose answer could
+    /// differ — each of the 256 segments, at every boundary RAM has.
+    #[test]
+    fn the_folded_ram_guard_accepts_what_the_two_checks_did() {
+        for width in [1u32, 2, 4] {
+            let limit = crate::mmio::constants::RAM_END - (width - 1);
+            for top in 0..=0xFFu32 {
+                for low in [
+                    0u32,
+                    1,
+                    4,
+                    limit - 1,
+                    limit,
+                    limit + 1,
+                    limit + 4,
+                    0x0100_0000,
+                    0x0200_0000,
+                    0x0400_0000,
+                    0x0FFF_FFFC,
+                    0x00FF_FFFF,
+                ] {
+                    let address = (top << 24) | (low & 0x00FF_FFFF) | (low & 0xFF00_0000);
+                    let asked = (address & 0x3FFF_FFFF) <= limit && ((address >> 28) | 4) == 12;
+                    let folded = ((address ^ RAM_FOLD as u32) & RAM_KEEP as u32) <= limit;
+                    assert_eq!(asked, folded, "{address:#010X} width {width}");
+                    if folded {
+                        assert_eq!(
+                            address & 0x3FFF_FFFF,
+                            (address ^ RAM_FOLD as u32) & RAM_KEEP as u32,
+                            "{address:#010X} lands at the same offset"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
     #[test]
     fn an_empty_block_validates() {
         validate(&[]);
@@ -2576,6 +2609,125 @@ mod arithmetic_tests {
     const START: u32 = 0x8000_3000;
     const CTX: usize = 64;
     const FMA_SLOT: i32 = 1;
+
+    /// The scanner carries a block on through a conditional branch that goes forward,
+    /// so one block holds both the branch and the code after it. Run in a WebAssembly
+    /// interpreter: not taken, everything after the branch runs and the block ends where
+    /// the scanner did; taken, it stops there and says where control went.
+    mod carrying_on {
+        use super::super::*;
+        use crate::gekko::msr::Msr;
+        use crate::system::GC;
+
+        const START: u32 = 0x8000_3000;
+        const CTX: usize = 64;
+
+        /// cmpwi r3,0 ; beq +12 ; addi r4,r4,1 ; addi r5,r5,1 ; blr
+        const WORDS: [u32; 5] = [0x2C03_0000, 0x4182_000C, 0x3884_0001, 0x38A5_0001, 0x4E80_0020];
+        const RETURN_TO: u32 = 0x8000_5000;
+
+        /// A console with the words in its RAM, since the scanner reads them from there.
+        fn console(r3: u32) -> System<GC> {
+            let mut sys = crate::gamecube::GameCube::new(START);
+            sys.gekko.msr = Msr::from(u32::from(sys.gekko.msr) | MSR_FP as u32);
+            sys.gekko.gprs[3] = r3;
+            sys.gekko.gprs[4] = 100;
+            sys.gekko.gprs[5] = 200;
+            sys.gekko.spr.lr = RETURN_TO;
+            let at = crate::mmio::virt_to_phys(START) as usize;
+            let mut ram = sys.mmio.ram_view_mut();
+            let room = ram.slice_mut(at, WORDS.len() * 4).unwrap();
+            for (i, word) in WORDS.iter().enumerate() {
+                room[4 * i..4 * i + 4].copy_from_slice(&word.to_be_bytes());
+            }
+            sys
+        }
+
+        fn run(r3: u32) -> (i32, u32, u32) {
+            let sys = console(r3);
+
+            let spec = crate::gekko::block::discover::<GC>(&sys, START);
+            assert_eq!(spec.len(), WORDS.len(), "the block carried on past the branch");
+            let steps: Vec<(u16, Instruction, u32)> = spec
+                .instrs
+                .iter()
+                .zip(&spec.pcs)
+                .map(|(&word, &at)| {
+                    let instr = Instruction(word);
+                    (crate::gekko::resolve::<GC>(instr), instr, at)
+                })
+                .collect();
+
+            let engine = wasmi::Engine::default();
+            let mut store = wasmi::Store::new(&engine, ());
+            let pages = (core::mem::size_of::<System<GC>>() / 65536 + 2) as u32;
+            let memory = wasmi::Memory::new(&mut store, wasmi::MemoryType::new(pages, None)).unwrap();
+            {
+                let data = memory.data_mut(&mut store);
+                data[CTX + abi::msr_offset::<GC>()..][..4].copy_from_slice(&u32::from(sys.gekko.msr).to_le_bytes());
+                for (i, gpr) in sys.gekko.gprs.iter().enumerate() {
+                    data[CTX + abi::gpr_base_offset::<GC>() + 4 * i..][..4].copy_from_slice(&gpr.to_le_bytes());
+                }
+                data[CTX + abi::lr_offset::<GC>()..][..4].copy_from_slice(&sys.gekko.spr.lr.to_le_bytes());
+            }
+            let table = wasmi::Table::new(
+                &mut store,
+                wasmi::TableType::new(wasmi::core::ValType::FuncRef, 2, None),
+                wasmi::Val::FuncRef(wasmi::Ref::Null),
+            )
+            .unwrap();
+            let mut linker = <wasmi::Linker<()>>::new(&engine);
+            linker.define(IMPORT_MODULE, MEMORY_IMPORT, memory).unwrap();
+            linker.define(IMPORT_MODULE, TABLE_IMPORT, table).unwrap();
+            let module = wasmi::Module::new(&engine, assemble(&[emit::<GC>(&sys, &steps, spec.end_pc())])).unwrap();
+            let instance = linker.instantiate_and_start(&mut store, &module).unwrap();
+            let block = instance.get_typed_func::<i32, i32>(&store, "0").unwrap();
+            let nia = block.call(&mut store, CTX as i32).unwrap();
+
+            let data = memory.data(&store);
+            let gpr = |r: usize| {
+                u32::from_le_bytes(
+                    data[CTX + abi::gpr_base_offset::<GC>() + 4 * r..][..4]
+                        .try_into()
+                        .unwrap(),
+                )
+            };
+            (nia, gpr(4), gpr(5))
+        }
+
+        /// What the interpreter does with the same block, for the same registers.
+        fn interpreted(r3: u32) -> (u32, u32, u32) {
+            let mut sys = console(r3);
+            let spec = crate::gekko::block::discover::<GC>(&sys, START);
+            let mut went = spec.end_pc();
+            for (i, (&word, &at)) in spec.instrs.iter().zip(&spec.pcs).enumerate() {
+                let instr = Instruction(word);
+                let expected = spec.pcs.get(i + 1).copied().unwrap_or(spec.end_pc());
+                sys.gekko.cia = at;
+                sys.gekko.nia = expected;
+                crate::gekko::execute::<GC>(crate::gekko::resolve::<GC>(instr), &mut sys, instr);
+                if sys.gekko.nia != expected {
+                    went = sys.gekko.nia;
+                    break;
+                }
+            }
+            (went, sys.gekko.gprs[4], sys.gekko.gprs[5])
+        }
+
+        #[test]
+        fn the_branch_is_not_taken_and_the_rest_runs() {
+            let (nia, r4, r5) = run(7);
+            assert_eq!((nia as u32, r4, r5), interpreted(7));
+            assert_eq!((nia as u32, r4, r5), (RETURN_TO, 101, 201));
+        }
+
+        #[test]
+        fn the_branch_is_taken_and_the_block_stops_there() {
+            let (nia, r4, r5) = run(0);
+            assert_eq!((nia as u32, r4, r5), interpreted(0));
+            assert_eq!((nia as u32, r4, r5), (START + 16, 100, 200));
+        }
+    }
 
     /// A-form: `op rD, rA, rB, rC` with a five-bit extended opcode.
     fn a_form(op: u32, xo: u32) -> u32 {

@@ -68,6 +68,15 @@ pub fn discover<const SYSTEM: SystemId>(sys: &System<SYSTEM>, start_pc: u32) -> 
         pcs.push(cur_pc);
 
         if let Some(t) = classify_terminator(instr) {
+            // A conditional branch that goes forward does not end the block: the block
+            // carries on down the path where it is not taken, and the emitter makes the
+            // taken one a way out. A backward one closes a loop, which is where the
+            // block has to end — it is what the idle classifier reads, and what makes
+            // the next time round a fresh look at the interrupts.
+            if t == TermKind::BranchCond && conditional_goes_forward(instr, cur_pc) {
+                pc = pc.wrapping_add(4);
+                continue;
+            }
             terminator = t;
             break;
         }
@@ -80,6 +89,17 @@ pub fn discover<const SYSTEM: SystemId>(sys: &System<SYSTEM>, start_pc: u32) -> 
         pcs,
         terminator,
     }
+}
+
+/// Whether a `bc` sends control forward, so that falling through it is carrying on.
+#[inline]
+fn conditional_goes_forward(instr: Instruction, pc: u32) -> bool {
+    let target = if instr.aa() {
+        instr.bd() as u32
+    } else {
+        pc.wrapping_add_signed(instr.bd())
+    };
+    target > pc
 }
 
 #[inline]
